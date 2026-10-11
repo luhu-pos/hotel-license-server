@@ -43,7 +43,7 @@ app.get('/api/check-license', (req, res) => {
   const licenses = loadLicenses();
   let info = licenses[hwid];
   if (!info) {
-    const altHwid = hwid.replace('-', '');
+    const altHwid = hwid.replace(/-/g, '');
     info = licenses[altHwid];
     if (info) hwid = altHwid;
   }
@@ -99,21 +99,26 @@ app.post('/api/sepay-webhook', (req, res) => {
   const normalized = content.replace(/[^A-Z0-9]/g, '');
   let hwid = null;
 
-  // 1. Nhận dạng Số điện thoại Việt Nam 10 số (bắt đầu bằng 03, 05, 07, 08, 09)
-  // Chỉ lấy đúng 10 số đầu, bỏ qua tất cả mã giao dịch ngân hàng kèm sau như FT...
-  const matchPhone = normalized.match(/HOTEL(0[35789][0-9]{8})/);
-  if (matchPhone) {
-    hwid = `HOTEL-${matchPhone[1]}`;
+  // 1. Nhận dạng Android ID: HOTELANDRXXXXXXXX... (Ví dụ: HOTELANDR8ACF1249)
+  const matchAndr = normalized.match(/HOTELANDR([A-Z0-9]{8})/);
+  if (matchAndr) {
+    hwid = `HOTEL-ANDR-${matchAndr[1]}`;
   } else {
-    // 2. Nhận dạng mã Desktop cũ (8 ký tự hex): HOTEL-XXXX-XXXX
-    const matchDesktop = normalized.match(/HOTEL([A-Z0-9]{4})([A-Z0-9]{4})/);
-    if (matchDesktop) {
-      hwid = `HOTEL-${matchDesktop[1]}-${matchDesktop[2]}`;
+    // 2. Nhận dạng Số điện thoại Việt Nam 10 số (bắt đầu bằng 03, 05, 07, 08, 09)
+    const matchPhone = normalized.match(/HOTEL(0[35789][0-9]{8})/);
+    if (matchPhone) {
+      hwid = `HOTEL-${matchPhone[1]}`;
     } else {
-      // 3. Nhận dạng mã Android ID hoặc mã khác
-      const matchMobile = normalized.match(/HOTEL([A-Z0-9]+)/);
-      if (matchMobile) {
-        hwid = `HOTEL-${matchMobile[1]}`;
+      // 3. Nhận dạng mã Desktop cũ (8 ký tự hex): HOTEL-XXXX-XXXX
+      const matchDesktop = normalized.match(/HOTEL([A-Z0-9]{4})([A-Z0-9]{4})/);
+      if (matchDesktop) {
+        hwid = `HOTEL-${matchDesktop[1]}-${matchDesktop[2]}`;
+      } else {
+        // 4. Nhận dạng trường hợp khác
+        const matchMobile = normalized.match(/HOTEL([A-Z0-9]+)/);
+        if (matchMobile) {
+          hwid = `HOTEL-${matchMobile[1]}`;
+        }
       }
     }
   }
