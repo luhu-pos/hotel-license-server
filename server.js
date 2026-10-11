@@ -32,9 +32,11 @@ app.get('/ping', (req, res) => {
   res.send({ status: 'active', serverTime: new Date().toISOString() });
 });
 
-// Endpoint kiểm tra bản quyền từ Desktop App
+// Endpoint kiểm tra bản quyền (Dùng chung cho cả Desktop và Mobile)
 app.get('/api/check-license', (req, res) => {
   const hwid = (req.query.hwid || '').trim().toUpperCase();
+  const token = (req.query.token || '').trim(); // Token máy mobile gửi lên để chống dùng chung
+
   if (!hwid) return res.status(400).json({ active: false, message: 'Thiếu HWID' });
 
   const licenses = loadLicenses();
@@ -46,11 +48,28 @@ app.get('/api/check-license', (req, res) => {
 
   const now = Date.now();
   if (info.expireAt > now) {
+    // Cơ chế chống dùng chung trên Mobile (Device Binding qua Token)
+    if (token) {
+      if (info.deviceToken && info.deviceToken !== token) {
+        return res.json({
+          active: false,
+          message: 'Bản quyền này đã được kích hoạt trên một thiết bị khác! Không thể dùng chung.'
+        });
+      }
+      // Gán token cho máy đầu tiên kích hoạt nếu chưa có
+      if (!info.deviceToken) {
+        info.deviceToken = token;
+        licenses[hwid] = info;
+        saveLicenses(licenses);
+      }
+    }
+
     return res.json({
       active: true,
       expireAt: info.expireAt,
       expireDate: new Date(info.expireAt).toLocaleString('vi-VN'),
-      package: info.package
+      package: info.package,
+      deviceToken: info.deviceToken || null
     });
   } else {
     return res.json({
@@ -72,15 +91,25 @@ app.post('/api/sepay-webhook', (req, res) => {
     return res.json({ success: false, message: 'Giao dịch không thuộc HOTEL POS' });
   }
 
-  // Tách HWID dạng HOTELXXXXX...
   const normalized = content.replace(/[^A-Z0-9]/g, '');
-  const match = normalized.match(/HOTEL([A-Z0-9]{4})([A-Z0-9]{4})/);
+  let hwid = null;
 
-  if (!match) {
-    return res.status(400).json({ error: 'Nội dung chuyển khoản không đúng định dạng HWID HOTEL' });
+  // 1. Nhận dạng mã máy tính cũ: HOTEL-XXXX-XXXX
+  const matchDesktop = normalized.match(/HOTEL([A-Z0-9]{4})([A-Z0-9]{4})/);
+  if (matchDesktop) {
+    hwid = `HOTEL-${matchDesktop[1]}-${matchDesktop[2]}`;
+  } else {
+    // 2. Nhận dạng mã điện thoại: Số điện thoại (HOTEL09xxx) hoặc Android (HOTELANDRxxx)
+    const matchMobile = normalized.match(/HOTEL([A-Z0-9]+)/);
+    if (matchMobile) {
+      hwid = `HOTEL-${matchMobile[1]}`;
+    }
   }
 
-  const hwid = `HOTEL-${match[1]}-${match[2]}`;
+  if (!hwid) {
+    return res.status(400).json({ error: 'Nội dung chuyển khoản không đúng định dạng HOTEL' });
+  }
+
   const now = Date.now();
   let addTimeMs = 0;
   let pkgName = '';
@@ -107,6 +136,7 @@ app.post('/api/sepay-webhook', (req, res) => {
     expireAt: currentExpire + addTimeMs,
     package: pkgName,
     lastPaymentAmount: amount,
+    deviceToken: licenses[hwid] ? licenses[hwid].deviceToken : null, // Giữ token thiết bị nếu đã đăng ký
     updatedAt: new Date().toISOString()
   };
 
