@@ -99,16 +99,22 @@ app.post('/api/sepay-webhook', (req, res) => {
   const normalized = content.replace(/[^A-Z0-9]/g, '');
   let hwid = null;
 
-  // 1. Nhận dạng mã Desktop cũ (8 ký tự hex): HOTEL-XXXX-XXXX
-  const matchDesktop = normalized.match(/HOTEL([A-Z0-9]{4})([A-Z0-9]{4})/);
-  // Loại trừ trường hợp số điện thoại 10 số (bắt đầu bằng 03, 05, 07, 08, 09)
-  if (matchDesktop && !normalized.match(/HOTEL0[35789][0-9]{8}/)) {
-    hwid = `HOTEL-${matchDesktop[1]}-${matchDesktop[2]}`;
+  // 1. Nhận dạng Số điện thoại Việt Nam 10 số (bắt đầu bằng 03, 05, 07, 08, 09)
+  // Chỉ lấy đúng 10 số đầu, bỏ qua tất cả mã giao dịch ngân hàng kèm sau như FT...
+  const matchPhone = normalized.match(/HOTEL(0[35789][0-9]{8})/);
+  if (matchPhone) {
+    hwid = `HOTEL-${matchPhone[1]}`;
   } else {
-    // 2. Nhận dạng SĐT hoặc Android ID: HOTEL-0941390903
-    const matchMobile = normalized.match(/HOTEL([A-Z0-9]+)/);
-    if (matchMobile) {
-      hwid = `HOTEL-${matchMobile[1]}`;
+    // 2. Nhận dạng mã Desktop cũ (8 ký tự hex): HOTEL-XXXX-XXXX
+    const matchDesktop = normalized.match(/HOTEL([A-Z0-9]{4})([A-Z0-9]{4})/);
+    if (matchDesktop) {
+      hwid = `HOTEL-${matchDesktop[1]}-${matchDesktop[2]}`;
+    } else {
+      // 3. Nhận dạng mã Android ID hoặc mã khác
+      const matchMobile = normalized.match(/HOTEL([A-Z0-9]+)/);
+      if (matchMobile) {
+        hwid = `HOTEL-${matchMobile[1]}`;
+      }
     }
   }
 
