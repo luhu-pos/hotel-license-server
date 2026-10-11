@@ -54,7 +54,8 @@ app.get('/api/check-license', (req, res) => {
 
   const now = Date.now();
   if (info.expireAt > now) {
-    if (token) {
+    // 1. Nếu là tài khoản Web/iOS dùng SĐT (bắt đầu bằng HOTEL-0): Chặn dùng chung nghiêm ngặt
+    if (token && hwid.startsWith('HOTEL-0')) {
       if (info.deviceToken && info.deviceToken !== token) {
         return res.json({
           active: false,
@@ -62,6 +63,13 @@ app.get('/api/check-license', (req, res) => {
         });
       }
       if (!info.deviceToken) {
+        info.deviceToken = token;
+        licenses[hwid] = info;
+        saveLicenses(licenses);
+      }
+    } else if (token) {
+      // 2. Nếu là Android ID phần cứng (HOTEL-ANDR-...): Luôn nhận token mới nếu người dùng cài lại app
+      if (info.deviceToken !== token) {
         info.deviceToken = token;
         licenses[hwid] = info;
         saveLicenses(licenses);
@@ -99,7 +107,7 @@ app.post('/api/sepay-webhook', (req, res) => {
   const normalized = content.replace(/[^A-Z0-9]/g, '');
   let hwid = null;
 
-  // 1. Nhận dạng Android ID: HOTELANDRXXXXXXXX... (Ví dụ: HOTELANDR8ACF1249)
+  // 1. Nhận dạng Android ID: HOTELANDRXXXXXXXX... (Ví dụ: HOTELANDRA52CA8A2)
   const matchAndr = normalized.match(/HOTELANDR([A-Z0-9]{8})/);
   if (matchAndr) {
     hwid = `HOTEL-ANDR-${matchAndr[1]}`;
@@ -162,7 +170,7 @@ app.post('/api/sepay-webhook', (req, res) => {
   return res.json({ success: true, hwid, expireAt: licenses[hwid].expireAt });
 });
 
-// Endpoint kích hoạt khẩn cấp trực tiếp qua trình duyệt
+// Endpoint kích hoạt khẩn cấp trực tiếp qua trình duyệt (Tự động xóa gán token cũ)
 app.get('/api/admin-activate', (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const days = parseInt(req.query.days || 30);
@@ -175,6 +183,7 @@ app.get('/api/admin-activate', (req, res) => {
     hwid: hwid,
     expireAt: now + days * 24 * 60 * 60 * 1000,
     package: `${days}_NGAY_ADMIN`,
+    deviceToken: null, // Reset token để nhận thiết bị mới
     updatedAt: new Date().toISOString()
   };
 
