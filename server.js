@@ -34,13 +34,19 @@ app.get('/ping', (req, res) => {
 
 // Endpoint kiểm tra bản quyền (Dùng chung cho cả Desktop và Mobile)
 app.get('/api/check-license', (req, res) => {
-  const hwid = (req.query.hwid || '').trim().toUpperCase();
-  const token = (req.query.token || '').trim(); // Token máy mobile gửi lên để chống dùng chung
+  let hwid = (req.query.hwid || '').trim().toUpperCase();
+  const token = (req.query.token || '').trim();
 
   if (!hwid) return res.status(400).json({ active: false, message: 'Thiếu HWID' });
 
+  // Tự động nhận diện cả dạng có gạch ngang hoặc không gạch ngang
   const licenses = loadLicenses();
-  const info = licenses[hwid];
+  let info = licenses[hwid];
+  if (!info) {
+    const altHwid = hwid.replace('-', '');
+    info = licenses[altHwid];
+    if (info) hwid = altHwid;
+  }
 
   if (!info) {
     return res.json({ active: false, message: 'Phần mềm chưa được kích hoạt bản quyền' });
@@ -48,7 +54,6 @@ app.get('/api/check-license', (req, res) => {
 
   const now = Date.now();
   if (info.expireAt > now) {
-    // Cơ chế chống dùng chung trên Mobile (Device Binding qua Token)
     if (token) {
       if (info.deviceToken && info.deviceToken !== token) {
         return res.json({
@@ -56,7 +61,6 @@ app.get('/api/check-license', (req, res) => {
           message: 'Bản quyền này đã được kích hoạt trên một thiết bị khác! Không thể dùng chung.'
         });
       }
-      // Gán token cho máy đầu tiên kích hoạt nếu chưa có
       if (!info.deviceToken) {
         info.deviceToken = token;
         licenses[hwid] = info;
@@ -83,10 +87,11 @@ app.get('/api/check-license', (req, res) => {
 // Webhook tiếp nhận thanh toán tự động từ SePay
 app.post('/api/sepay-webhook', (req, res) => {
   const body = req.body;
-  const content = (body.content || '').toUpperCase();
-  const amount = parseInt(body.transferAmount || 0);
+  const content = (body.content || body.description || '').toUpperCase();
+  const amount = parseInt(body.transferAmount || body.amount || 0);
 
-  // Chỉ nhận các giao dịch có chứa tiền tố HOTEL (không xung đột với CAFE hay BIDA)
+  console.log(`[SePay Webhook] Tiền: ${amount} đ | Nội dung: ${content}`);
+
   if (!content.includes('HOTEL')) {
     return res.json({ success: false, message: 'Giao dịch không thuộc HOTEL POS' });
   }
@@ -94,12 +99,13 @@ app.post('/api/sepay-webhook', (req, res) => {
   const normalized = content.replace(/[^A-Z0-9]/g, '');
   let hwid = null;
 
-  // 1. Nhận dạng mã máy tính cũ: HOTEL-XXXX-XXXX
+  // 1. Nhận dạng mã Desktop cũ (8 ký tự hex): HOTEL-XXXX-XXXX
   const matchDesktop = normalized.match(/HOTEL([A-Z0-9]{4})([A-Z0-9]{4})/);
-  if (matchDesktop) {
+  // Loại trừ trường hợp số điện thoại 10 số (bắt đầu bằng 03, 05, 07, 08, 09)
+  if (matchDesktop && !normalized.match(/HOTEL0[35789][0-9]{8}/)) {
     hwid = `HOTEL-${matchDesktop[1]}-${matchDesktop[2]}`;
   } else {
-    // 2. Nhận dạng mã điện thoại: Số điện thoại (HOTEL09xxx) hoặc Android (HOTELANDRxxx)
+    // 2. Nhận dạng SĐT hoặc Android ID: HOTEL-0941390903
     const matchMobile = normalized.match(/HOTEL([A-Z0-9]+)/);
     if (matchMobile) {
       hwid = `HOTEL-${matchMobile[1]}`;
@@ -114,18 +120,17 @@ app.post('/api/sepay-webhook', (req, res) => {
   let addTimeMs = 0;
   let pkgName = '';
 
-  // 3 Gói bản quyền theo số tiền
   if (amount >= 299000) {
-    addTimeMs = 180 * 24 * 60 * 60 * 1000; // 6 tháng (180 ngày)
+    addTimeMs = 180 * 24 * 60 * 60 * 1000;
     pkgName = '6_THANG';
   } else if (amount >= 59000) {
-    addTimeMs = 30 * 24 * 60 * 60 * 1000;  // 1 tháng (30 ngày)
+    addTimeMs = 30 * 24 * 60 * 60 * 1000;
     pkgName = '1_THANG';
   } else if (amount >= 2000) {
-    addTimeMs = 10 * 60 * 1000;             // 10 phút dùng thử
+    addTimeMs = 10 * 60 * 1000;
     pkgName = '10_PHUT';
   } else {
-    return res.json({ success: false, message: 'Số tiền chuyển không khớp gói bản quyền nào' });
+    return res.json({ success: false, message: 'Số tiền không khớp gói bản quyền nào' });
   }
 
   const licenses = loadLicenses();
@@ -136,14 +141,34 @@ app.post('/api/sepay-webhook', (req, res) => {
     expireAt: currentExpire + addTimeMs,
     package: pkgName,
     lastPaymentAmount: amount,
-    deviceToken: licenses[hwid] ? licenses[hwid].deviceToken : null, // Giữ token thiết bị nếu đã đăng ký
+    deviceToken: licenses[hwid] ? licenses[hwid].deviceToken : null,
     updatedAt: new Date().toISOString()
   };
 
   saveLicenses(licenses);
-  console.log(`[HOTEL POS] Đã kích hoạt HWID: ${hwid} | Gói: ${pkgName} | Hạn mới: ${new Date(licenses[hwid].expireAt).toLocaleString('vi-VN')}`);
+  console.log(`[HOTEL POS] ĐÃ KÍCH HOẠT THÀNH CÔNG CHO: ${hwid}`);
 
   return res.json({ success: true, hwid, expireAt: licenses[hwid].expireAt });
+});
+
+// Endpoint kích hoạt khẩn cấp trực tiếp qua trình duyệt
+app.get('/api/admin-activate', (req, res) => {
+  let hwid = (req.query.hwid || '').trim().toUpperCase();
+  const days = parseInt(req.query.days || 30);
+  if (!hwid) return res.send('Thiếu hwid');
+
+  const licenses = loadLicenses();
+  const now = Date.now();
+
+  licenses[hwid] = {
+    hwid: hwid,
+    expireAt: now + days * 24 * 60 * 60 * 1000,
+    package: `${days}_NGAY_ADMIN`,
+    updatedAt: new Date().toISOString()
+  };
+
+  saveLicenses(licenses);
+  return res.json({ success: true, message: `Đã kích hoạt ${days} ngày cho ${hwid}`, expireAt: licenses[hwid].expireAt });
 });
 
 const PORT = process.env.PORT || 3000;
