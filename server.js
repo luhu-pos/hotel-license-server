@@ -7,6 +7,7 @@ app.use(cors());
 app.use(express.json());
 
 const DB_FILE = './licenses.json';
+const ADMIN_SECRET_KEY = 'ADMIN_LUHU_2026'; // Khóa bảo mật trang Admin Dashboard
 
 function loadLicenses() {
   if (fs.existsSync(DB_FILE)) {
@@ -32,11 +33,11 @@ app.get('/ping', (req, res) => {
   res.send({ status: 'active', serverTime: new Date().toISOString() });
 });
 
-// Endpoint kiểm tra bản quyền & Xử lý chuyển đổi trình duyệt kèm xác thực PIN
+// Endpoint kiểm tra bản quyền & Xử lý chuyển đổi thiết bị kèm xác thực PIN
 app.get('/api/check-license', (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
-  const pin = (req.query.pin || '').trim(); // Mã PIN 4 số gửi từ máy khách
+  const pin = (req.query.pin || '').trim();
 
   if (!hwid) return res.status(400).json({ active: false, message: 'Thiếu HWID' });
 
@@ -61,12 +62,12 @@ app.get('/api/check-license', (req, res) => {
     });
   }
 
-  const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const todayStr = new Date().toISOString().slice(0, 10);
 
-  // Kiểm tra & Xử lý trường hợp đổi thiết bị / trình duyệt (Chrome, Safari, Cốc Cốc, Zalo...)
+  // Kiểm tra & Xử lý trường hợp chuyển sang thiết bị / trình duyệt khác
   if (token && hwid.startsWith('HOTEL-0')) {
     if (info.deviceToken && info.deviceToken !== token) {
-      // 1. Kiểm tra mã PIN Quản trị (Mặc định: 1234 nếu chưa đổi)
+      // 1. Kiểm tra mã PIN Quản trị (Mặc định: 1234)
       const correctPin = info.adminPin || "1234";
       if (!pin || pin !== correctPin) {
         return res.json({
@@ -83,7 +84,7 @@ app.get('/api/check-license', (req, res) => {
         info.lastSwitchDate = todayStr;
       }
 
-      // 3. Giới hạn: Tối đa 5 lần đổi trong 1 ngày
+      // 3. Giới hạn tối đa 5 lần đổi trong 1 ngày
       const MAX_SWITCH_PER_DAY = 5;
       if ((info.switchCountToday || 0) >= MAX_SWITCH_PER_DAY) {
         return res.json({
@@ -93,7 +94,7 @@ app.get('/api/check-license', (req, res) => {
         });
       }
 
-      // 4. Giới hạn: Mỗi lần đổi cách nhau tối thiểu 5 phút (300.000 ms)
+      // 4. Giới hạn mỗi lần đổi cách nhau tối thiểu 5 phút
       const COOLDOWN_MS = 5 * 60 * 1000;
       const lastSwitch = info.lastSwitchTime || 0;
       const elapsed = now - lastSwitch;
@@ -107,7 +108,7 @@ app.get('/api/check-license', (req, res) => {
         });
       }
 
-      // Đủ điều kiện -> Cập nhật thiết bị mới làm thiết bị chính, thiết bị cũ bị đá ra
+      // Đủ điều kiện -> Cập nhật thiết bị mới
       info.deviceToken = token;
       info.lastSwitchTime = now;
       info.switchCountToday = (info.switchCountToday || 0) + 1;
@@ -169,7 +170,7 @@ app.get('/api/sync-pin', (req, res) => {
   return res.json({ success: false, message: 'Không thể đồng bộ mã PIN' });
 });
 
-// Webhook tiếp nhận thanh toán tự động từ SePay
+// Webhook tiếp nhận thanh toán tự động từ SePay (Tự lưu lịch sử giao dịch)
 app.post('/api/sepay-webhook', (req, res) => {
   const body = req.body;
   const content = (body.content || body.description || '').toUpperCase();
@@ -227,49 +228,141 @@ app.post('/api/sepay-webhook', (req, res) => {
 
   const licenses = loadLicenses();
   const currentExpire = (licenses[hwid] && licenses[hwid].expireAt > now) ? licenses[hwid].expireAt : now;
+  const newExpire = currentExpire + addTimeMs;
+
+  const existing = licenses[hwid] || {};
+  const history = existing.paymentHistory || [];
+
+  // Lưu lịch sử từng lần nạp
+  history.push({
+    amount: amount,
+    package: pkgName,
+    time: new Date().toISOString(),
+    transactionId: body.id || Date.now()
+  });
 
   licenses[hwid] = {
     hwid: hwid,
-    expireAt: currentExpire + addTimeMs,
+    expireAt: newExpire,
     package: pkgName,
     lastPaymentAmount: amount,
-    deviceToken: licenses[hwid] ? licenses[hwid].deviceToken : null,
-    adminPin: licenses[hwid] && licenses[hwid].adminPin ? licenses[hwid].adminPin : "1234",
-    lastSwitchTime: licenses[hwid] ? licenses[hwid].lastSwitchTime : 0,
-    switchCountToday: licenses[hwid] ? licenses[hwid].switchCountToday : 0,
-    lastSwitchDate: licenses[hwid] ? licenses[hwid].lastSwitchDate : '',
-    updatedAt: new Date().toISOString()
+    lastPaymentTime: new Date().toISOString(),
+    deviceToken: existing.deviceToken || null,
+    adminPin: existing.adminPin || "1234",
+    lastSwitchTime: existing.lastSwitchTime || 0,
+    switchCountToday: existing.switchCountToday || 0,
+    lastSwitchDate: existing.lastSwitchDate || '',
+    updatedAt: new Date().toISOString(),
+    paymentHistory: history
   };
 
   saveLicenses(licenses);
-  console.log(`[HOTEL POS] ĐÃ KÍCH HOẠT THÀNH CÔNG CHO: ${hwid}`);
+  console.log(`[HOTEL POS] ĐÃ KÍCH HOẠT THÀNH CÔNG CHO: ${hwid} - Hạn mới: ${new Date(newExpire).toLocaleString('vi-VN')}`);
 
-  return res.json({ success: true, hwid, expireAt: licenses[hwid].expireAt });
+  return res.json({ success: true, hwid, expireAt: newExpire });
 });
 
-// Endpoint kích hoạt khẩn cấp trực tiếp
+// Endpoint kích hoạt khẩn cấp trực tiếp (tự làm sạch ký tự ngoặc nhọn nếu lỡ gõ)
 app.get('/api/admin-activate', (req, res) => {
-  let hwid = (req.query.hwid || '').trim().toUpperCase();
+  let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
   const days = parseInt(req.query.days || 30);
   if (!hwid) return res.send('Thiếu hwid');
 
   const licenses = loadLicenses();
   const now = Date.now();
+  const existing = licenses[hwid] || {};
 
   licenses[hwid] = {
     hwid: hwid,
     expireAt: now + days * 24 * 60 * 60 * 1000,
     package: `${days}_NGAY_ADMIN`,
+    lastPaymentAmount: 0,
+    lastPaymentTime: new Date().toISOString(),
     deviceToken: null,
-    adminPin: "1234",
+    adminPin: existing.adminPin || "1234",
     lastSwitchTime: 0,
     switchCountToday: 0,
     lastSwitchDate: '',
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    paymentHistory: existing.paymentHistory || []
   };
 
   saveLicenses(licenses);
   return res.json({ success: true, message: `Đã kích hoạt ${days} ngày cho ${hwid}`, expireAt: licenses[hwid].expireAt });
+});
+
+// Endpoint kỹ thuật viên Reset mã PIN về 1234 (Giữ nguyên ngày hết hạn hiện tại)
+app.get('/api/admin-reset-pin', (req, res) => {
+  let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
+  const pin = (req.query.pin || '1234').trim();
+
+  if (!hwid) return res.status(400).send('Thiếu tham số hwid');
+
+  const licenses = loadLicenses();
+  let info = licenses[hwid];
+  if (!info) {
+    const altHwid = hwid.replace(/-/g, '');
+    info = licenses[altHwid];
+    if (info) hwid = altHwid;
+  }
+
+  if (!info) {
+    return res.status(404).json({ success: false, message: 'Không tìm thấy cơ sở này trên server!' });
+  }
+
+  info.adminPin = pin;
+  info.updatedAt = new Date().toISOString();
+  licenses[hwid] = info;
+  saveLicenses(licenses);
+
+  return res.json({
+    success: true,
+    message: `Đã reset mã PIN của ${hwid} về: ${pin} (Thời hạn giữ nguyên)`,
+    expireAt: info.expireAt,
+    expireDate: new Date(info.expireAt).toLocaleString('vi-VN')
+  });
+});
+
+// API cung cấp dữ liệu cho phần mềm con Admin Dashboard
+app.get('/api/admin/dashboard-data', (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== ADMIN_SECRET_KEY) {
+    return res.status(403).json({ success: false, message: 'Từ chối truy cập! Khóa bí mật không đúng.' });
+  }
+
+  const licenses = loadLicenses();
+  const customerList = [];
+  const now = Date.now();
+
+  for (let hwid in licenses) {
+    const item = licenses[hwid];
+    const isCleanHwid = hwid.startsWith('HOTEL-') ? hwid : 'HOTEL-' + hwid;
+    const phone = hwid.replace('HOTEL-', '').replace(/[^0-9]/g, '');
+
+    customerList.push({
+      hwid: isCleanHwid,
+      phone: phone || hwid,
+      adminPin: item.adminPin || '1234',
+      expireAt: item.expireAt || 0,
+      expireDate: item.expireAt ? new Date(item.expireAt).toLocaleString('vi-VN') : 'Chưa có',
+      isActive: (item.expireAt || 0) > now,
+      daysLeft: Math.max(0, Math.ceil(((item.expireAt || 0) - now) / (1000 * 60 * 60 * 24))),
+      lastPaymentAmount: item.lastPaymentAmount || 0,
+      lastPaymentTime: item.lastPaymentTime ? new Date(item.lastPaymentTime).toLocaleString('vi-VN') : '---',
+      lastSwitchAt: item.lastSwitchTime ? new Date(item.lastSwitchTime).toLocaleString('vi-VN') : '---',
+      paymentHistory: item.paymentHistory || []
+    });
+  }
+
+  // Sắp xếp: Khách còn hạn dùng nhiều nhất lên đầu
+  customerList.sort((a, b) => b.expireAt - a.expireAt);
+
+  res.json({
+    success: true,
+    totalCustomers: customerList.length,
+    activeCustomers: customerList.filter(c => c.isActive).length,
+    customers: customerList
+  });
 });
 
 const PORT = process.env.PORT || 3000;
