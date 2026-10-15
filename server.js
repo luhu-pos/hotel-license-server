@@ -32,10 +32,11 @@ app.get('/ping', (req, res) => {
   res.send({ status: 'active', serverTime: new Date().toISOString() });
 });
 
-// Endpoint kiểm tra bản quyền & Xử lý chuyển đổi trình duyệt thông minh
+// Endpoint kiểm tra bản quyền & Xử lý chuyển đổi trình duyệt kèm xác thực PIN
 app.get('/api/check-license', (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
+  const pin = (req.query.pin || '').trim(); // Mã PIN 4 số gửi từ máy khách
 
   if (!hwid) return res.status(400).json({ active: false, message: 'Thiếu HWID' });
 
@@ -65,13 +66,24 @@ app.get('/api/check-license', (req, res) => {
   // Kiểm tra & Xử lý trường hợp đổi thiết bị / trình duyệt (Chrome, Safari, Cốc Cốc, Zalo...)
   if (token && hwid.startsWith('HOTEL-0')) {
     if (info.deviceToken && info.deviceToken !== token) {
-      // Reset số lượt đổi nếu sang ngày mới
+      // 1. Kiểm tra mã PIN Quản trị (Mặc định: 1234 nếu chưa đổi)
+      const correctPin = info.adminPin || "1234";
+      if (!pin || pin !== correctPin) {
+        return res.json({
+          active: false,
+          isKicked: true,
+          requirePin: true,
+          message: 'Mã PIN quản trị không đúng! Vui lòng nhập đúng PIN 4 số để chuyển thiết bị.'
+        });
+      }
+
+      // 2. Reset số lượt đổi nếu sang ngày mới
       if (info.lastSwitchDate !== todayStr) {
         info.switchCountToday = 0;
         info.lastSwitchDate = todayStr;
       }
 
-      // Giới hạn 1: Tối đa 5 lần đổi trong 1 ngày
+      // 3. Giới hạn: Tối đa 5 lần đổi trong 1 ngày
       const MAX_SWITCH_PER_DAY = 5;
       if ((info.switchCountToday || 0) >= MAX_SWITCH_PER_DAY) {
         return res.json({
@@ -81,7 +93,7 @@ app.get('/api/check-license', (req, res) => {
         });
       }
 
-      // Giới hạn 2: Mỗi lần đổi cách nhau tối thiểu 5 phút (300.000 ms)
+      // 4. Giới hạn: Mỗi lần đổi cách nhau tối thiểu 5 phút (300.000 ms)
       const COOLDOWN_MS = 5 * 60 * 1000;
       const lastSwitch = info.lastSwitchTime || 0;
       const elapsed = now - lastSwitch;
@@ -91,7 +103,7 @@ app.get('/api/check-license', (req, res) => {
         return res.json({
           active: false,
           isKicked: true,
-          message: `Tài khoản đang mở ở trình duyệt khác. Vui lòng đợi ${waitMinutes} phút nữa để chuyển sang máy này!`
+          message: `Tài khoản vừa chuyển thiết bị gần đây. Vui lòng đợi ${waitMinutes} phút nữa để đăng nhập lại!`
         });
       }
 
@@ -107,11 +119,11 @@ app.get('/api/check-license', (req, res) => {
       info.lastSwitchTime = now;
       info.switchCountToday = 0;
       info.lastSwitchDate = todayStr;
+      if (!info.adminPin) info.adminPin = "1234";
       licenses[hwid] = info;
       saveLicenses(licenses);
     }
   } else if (token) {
-    // Với Android ID phần cứng
     if (info.deviceToken !== token) {
       info.deviceToken = token;
       licenses[hwid] = info;
@@ -124,8 +136,37 @@ app.get('/api/check-license', (req, res) => {
     expireAt: info.expireAt,
     expireDate: new Date(info.expireAt).toLocaleString('vi-VN'),
     package: info.package,
+    adminPin: info.adminPin || "1234",
     deviceToken: info.deviceToken || null
   });
+});
+
+// Endpoint đồng bộ khi khách đổi mã PIN trong phần Cài đặt
+app.get('/api/sync-pin', (req, res) => {
+  let hwid = (req.query.hwid || '').trim().toUpperCase();
+  const newPin = (req.query.newPin || '').trim();
+  const token = (req.query.token || '').trim();
+
+  if (!hwid || !newPin || newPin.length !== 4) {
+    return res.json({ success: false, message: 'Dữ liệu không hợp lệ' });
+  }
+
+  const licenses = loadLicenses();
+  let info = licenses[hwid];
+  if (!info) {
+    const altHwid = hwid.replace(/-/g, '');
+    info = licenses[altHwid];
+    if (info) hwid = altHwid;
+  }
+
+  if (info && info.deviceToken === token) {
+    info.adminPin = newPin;
+    licenses[hwid] = info;
+    saveLicenses(licenses);
+    return res.json({ success: true, message: 'Đã cập nhật mã PIN trên máy chủ!' });
+  }
+
+  return res.json({ success: false, message: 'Không thể đồng bộ mã PIN' });
 });
 
 // Webhook tiếp nhận thanh toán tự động từ SePay
@@ -193,6 +234,7 @@ app.post('/api/sepay-webhook', (req, res) => {
     package: pkgName,
     lastPaymentAmount: amount,
     deviceToken: licenses[hwid] ? licenses[hwid].deviceToken : null,
+    adminPin: licenses[hwid] && licenses[hwid].adminPin ? licenses[hwid].adminPin : "1234",
     lastSwitchTime: licenses[hwid] ? licenses[hwid].lastSwitchTime : 0,
     switchCountToday: licenses[hwid] ? licenses[hwid].switchCountToday : 0,
     lastSwitchDate: licenses[hwid] ? licenses[hwid].lastSwitchDate : '',
@@ -218,7 +260,8 @@ app.get('/api/admin-activate', (req, res) => {
     hwid: hwid,
     expireAt: now + days * 24 * 60 * 60 * 1000,
     package: `${days}_NGAY_ADMIN`,
-    deviceToken: null, // Reset token để nhận thiết bị mới
+    deviceToken: null,
+    adminPin: "1234",
     lastSwitchTime: 0,
     switchCountToday: 0,
     lastSwitchDate: '',
