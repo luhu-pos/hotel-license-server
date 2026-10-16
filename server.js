@@ -1,51 +1,50 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const app = express();
+const { MongoClient } = require('mongodb');
 
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-const DB_FILE = './licenses.json';
-const ADMIN_SECRET_KEY = 'ADMIN_LUHU_2026'; // Khóa bảo mật trang Admin Dashboard
+const ADMIN_SECRET_KEY = 'ADMIN_LUHU_2026';
 
-function loadLicenses() {
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
-    } catch (e) {
-      return {};
-    }
-  }
-  return {};
-}
+// Chuỗi kết nối MongoDB Atlas của bạn
+const MONGO_URI = "mongodb+srv://vominhluanytb_db_user:yhVSvXpDXvPFsa46@luan.ygb6k80.mongodb.net/hotel_pos?retryWrites=true&w=majority&appName=Luan";
+const client = new MongoClient(MONGO_URI);
 
-function saveLicenses(data) {
+let licensesCollection;
+
+// Kết nối MongoDB Database
+async function connectDB() {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
-  } catch (e) {
-    console.error("Lỗi ghi licenses.json:", e);
+    await client.connect();
+    const db = client.db('hotel_pos');
+    licensesCollection = db.collection('licenses');
+    console.log("✅ Đã kết nối thành công tới Cloud MongoDB Atlas!");
+  } catch (err) {
+    console.error("❌ Lỗi kết nối MongoDB:", err);
   }
 }
+connectDB();
 
 // Endpoint ping chống ngủ đông cho Render
 app.get('/ping', (req, res) => {
   res.send({ status: 'active', serverTime: new Date().toISOString() });
 });
 
-// Endpoint kiểm tra bản quyền & Xử lý chuyển đổi thiết bị kèm xác thực PIN
-app.get('/api/check-license', (req, res) => {
+// Endpoint kiểm tra bản quyền & Xử lý chuyển đổi thiết bị kèm PIN
+app.get('/api/check-license', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
   const pin = (req.query.pin || '').trim();
 
   if (!hwid) return res.status(400).json({ active: false, message: 'Thiếu HWID' });
+  if (!licensesCollection) return res.status(500).json({ active: false, message: 'Database chưa sẵn sàng' });
 
-  const licenses = loadLicenses();
-  let info = licenses[hwid];
+  let info = await licensesCollection.findOne({ hwid: hwid });
   if (!info) {
     const altHwid = hwid.replace(/-/g, '');
-    info = licenses[altHwid];
+    info = await licensesCollection.findOne({ hwid: altHwid });
     if (info) hwid = altHwid;
   }
 
@@ -64,10 +63,9 @@ app.get('/api/check-license', (req, res) => {
 
   const todayStr = new Date().toISOString().slice(0, 10);
 
-  // Kiểm tra & Xử lý trường hợp chuyển sang thiết bị / trình duyệt khác
+  // Xử lý chuyển thiết bị / trình duyệt
   if (token && hwid.startsWith('HOTEL-0')) {
     if (info.deviceToken && info.deviceToken !== token) {
-      // 1. Kiểm tra mã PIN Quản trị (Mặc định: 1234)
       const correctPin = info.adminPin || "1234";
       if (!pin || pin !== correctPin) {
         return res.json({
@@ -78,13 +76,11 @@ app.get('/api/check-license', (req, res) => {
         });
       }
 
-      // 2. Reset số lượt đổi nếu sang ngày mới
       if (info.lastSwitchDate !== todayStr) {
         info.switchCountToday = 0;
         info.lastSwitchDate = todayStr;
       }
 
-      // 3. Giới hạn tối đa 5 lần đổi trong 1 ngày
       const MAX_SWITCH_PER_DAY = 5;
       if ((info.switchCountToday || 0) >= MAX_SWITCH_PER_DAY) {
         return res.json({
@@ -94,7 +90,6 @@ app.get('/api/check-license', (req, res) => {
         });
       }
 
-      // 4. Giới hạn mỗi lần đổi cách nhau tối thiểu 5 phút
       const COOLDOWN_MS = 5 * 60 * 1000;
       const lastSwitch = info.lastSwitchTime || 0;
       const elapsed = now - lastSwitch;
@@ -108,28 +103,33 @@ app.get('/api/check-license', (req, res) => {
         });
       }
 
-      // Đủ điều kiện -> Cập nhật thiết bị mới
-      info.deviceToken = token;
-      info.lastSwitchTime = now;
-      info.switchCountToday = (info.switchCountToday || 0) + 1;
-      info.lastSwitchDate = todayStr;
-      licenses[hwid] = info;
-      saveLicenses(licenses);
+      await licensesCollection.updateOne(
+        { hwid: hwid },
+        {
+          $set: {
+            deviceToken: token,
+            lastSwitchTime: now,
+            switchCountToday: (info.switchCountToday || 0) + 1,
+            lastSwitchDate: todayStr
+          }
+        }
+      );
     } else if (!info.deviceToken) {
-      info.deviceToken = token;
-      info.lastSwitchTime = now;
-      info.switchCountToday = 0;
-      info.lastSwitchDate = todayStr;
-      if (!info.adminPin) info.adminPin = "1234";
-      licenses[hwid] = info;
-      saveLicenses(licenses);
+      await licensesCollection.updateOne(
+        { hwid: hwid },
+        {
+          $set: {
+            deviceToken: token,
+            lastSwitchTime: now,
+            switchCountToday: 0,
+            lastSwitchDate: todayStr,
+            adminPin: info.adminPin || "1234"
+          }
+        }
+      );
     }
-  } else if (token) {
-    if (info.deviceToken !== token) {
-      info.deviceToken = token;
-      licenses[hwid] = info;
-      saveLicenses(licenses);
-    }
+  } else if (token && info.deviceToken !== token) {
+    await licensesCollection.updateOne({ hwid: hwid }, { $set: { deviceToken: token } });
   }
 
   return res.json({
@@ -142,8 +142,8 @@ app.get('/api/check-license', (req, res) => {
   });
 });
 
-// Endpoint đồng bộ khi khách đổi mã PIN trong phần Cài đặt
-app.get('/api/sync-pin', (req, res) => {
+// Đồng bộ khi khách đổi PIN trong Cài đặt
+app.get('/api/sync-pin', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const newPin = (req.query.newPin || '').trim();
   const token = (req.query.token || '').trim();
@@ -151,27 +151,25 @@ app.get('/api/sync-pin', (req, res) => {
   if (!hwid || !newPin || newPin.length !== 4) {
     return res.json({ success: false, message: 'Dữ liệu không hợp lệ' });
   }
+  if (!licensesCollection) return res.json({ success: false, message: 'Database chưa sẵn sàng' });
 
-  const licenses = loadLicenses();
-  let info = licenses[hwid];
+  let info = await licensesCollection.findOne({ hwid: hwid });
   if (!info) {
     const altHwid = hwid.replace(/-/g, '');
-    info = licenses[altHwid];
+    info = await licensesCollection.findOne({ hwid: altHwid });
     if (info) hwid = altHwid;
   }
 
   if (info && info.deviceToken === token) {
-    info.adminPin = newPin;
-    licenses[hwid] = info;
-    saveLicenses(licenses);
+    await licensesCollection.updateOne({ hwid: hwid }, { $set: { adminPin: newPin } });
     return res.json({ success: true, message: 'Đã cập nhật mã PIN trên máy chủ!' });
   }
 
   return res.json({ success: false, message: 'Không thể đồng bộ mã PIN' });
 });
 
-// Webhook tiếp nhận thanh toán tự động từ SePay (Tự lưu lịch sử giao dịch)
-app.post('/api/sepay-webhook', (req, res) => {
+// Webhook SePay lưu trực tiếp vào MongoDB
+app.post('/api/sepay-webhook', async (req, res) => {
   const body = req.body;
   const content = (body.content || body.description || '').toUpperCase();
   const amount = parseInt(body.transferAmount || body.amount || 0);
@@ -226,14 +224,11 @@ app.post('/api/sepay-webhook', (req, res) => {
     return res.json({ success: false, message: 'Số tiền không khớp gói bản quyền nào' });
   }
 
-  const licenses = loadLicenses();
-  const currentExpire = (licenses[hwid] && licenses[hwid].expireAt > now) ? licenses[hwid].expireAt : now;
+  const existing = (await licensesCollection.findOne({ hwid: hwid })) || {};
+  const currentExpire = (existing.expireAt && existing.expireAt > now) ? existing.expireAt : now;
   const newExpire = currentExpire + addTimeMs;
 
-  const existing = licenses[hwid] || {};
   const history = existing.paymentHistory || [];
-
-  // Lưu lịch sử từng lần nạp
   history.push({
     amount: amount,
     package: pkgName,
@@ -241,68 +236,76 @@ app.post('/api/sepay-webhook', (req, res) => {
     transactionId: body.id || Date.now()
   });
 
-  licenses[hwid] = {
-    hwid: hwid,
-    expireAt: newExpire,
-    package: pkgName,
-    lastPaymentAmount: amount,
-    lastPaymentTime: new Date().toISOString(),
-    deviceToken: existing.deviceToken || null,
-    adminPin: existing.adminPin || "1234",
-    lastSwitchTime: existing.lastSwitchTime || 0,
-    switchCountToday: existing.switchCountToday || 0,
-    lastSwitchDate: existing.lastSwitchDate || '',
-    updatedAt: new Date().toISOString(),
-    paymentHistory: history
-  };
+  await licensesCollection.updateOne(
+    { hwid: hwid },
+    {
+      $set: {
+        hwid: hwid,
+        expireAt: newExpire,
+        package: pkgName,
+        lastPaymentAmount: amount,
+        lastPaymentTime: new Date().toISOString(),
+        deviceToken: existing.deviceToken || null,
+        adminPin: existing.adminPin || "1234",
+        lastSwitchTime: existing.lastSwitchTime || 0,
+        switchCountToday: existing.switchCountToday || 0,
+        lastSwitchDate: existing.lastSwitchDate || '',
+        updatedAt: new Date().toISOString(),
+        paymentHistory: history
+      }
+    },
+    { upsert: true }
+  );
 
-  saveLicenses(licenses);
   console.log(`[HOTEL POS] ĐÃ KÍCH HOẠT THÀNH CÔNG CHO: ${hwid} - Hạn mới: ${new Date(newExpire).toLocaleString('vi-VN')}`);
-
   return res.json({ success: true, hwid, expireAt: newExpire });
 });
 
-// Endpoint kích hoạt khẩn cấp trực tiếp (tự làm sạch ký tự ngoặc nhọn nếu lỡ gõ)
-app.get('/api/admin-activate', (req, res) => {
+// Endpoint kích hoạt khẩn cấp trực tiếp
+app.get('/api/admin-activate', async (req, res) => {
   let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
   const days = parseInt(req.query.days || 30);
   if (!hwid) return res.send('Thiếu hwid');
 
-  const licenses = loadLicenses();
   const now = Date.now();
-  const existing = licenses[hwid] || {};
+  const existing = (await licensesCollection.findOne({ hwid: hwid })) || {};
 
-  licenses[hwid] = {
-    hwid: hwid,
-    expireAt: now + days * 24 * 60 * 60 * 1000,
-    package: `${days}_NGAY_ADMIN`,
-    lastPaymentAmount: 0,
-    lastPaymentTime: new Date().toISOString(),
-    deviceToken: null,
-    adminPin: existing.adminPin || "1234",
-    lastSwitchTime: 0,
-    switchCountToday: 0,
-    lastSwitchDate: '',
-    updatedAt: new Date().toISOString(),
-    paymentHistory: existing.paymentHistory || []
-  };
+  const expireAt = now + days * 24 * 60 * 60 * 1000;
+  await licensesCollection.updateOne(
+    { hwid: hwid },
+    {
+      $set: {
+        hwid: hwid,
+        expireAt: expireAt,
+        package: `${days}_NGAY_ADMIN`,
+        lastPaymentAmount: 0,
+        lastPaymentTime: new Date().toISOString(),
+        deviceToken: null,
+        adminPin: existing.adminPin || "1234",
+        lastSwitchTime: 0,
+        switchCountToday: 0,
+        lastSwitchDate: '',
+        updatedAt: new Date().toISOString(),
+        paymentHistory: existing.paymentHistory || []
+      }
+    },
+    { upsert: true }
+  );
 
-  saveLicenses(licenses);
-  return res.json({ success: true, message: `Đã kích hoạt ${days} ngày cho ${hwid}`, expireAt: licenses[hwid].expireAt });
+  return res.json({ success: true, message: `Đã kích hoạt ${days} ngày cho ${hwid}`, expireAt });
 });
 
-// Endpoint kỹ thuật viên Reset mã PIN về 1234 (Giữ nguyên ngày hết hạn hiện tại)
-app.get('/api/admin-reset-pin', (req, res) => {
+// Reset mã PIN về 1234 giữ nguyên ngày dùng
+app.get('/api/admin-reset-pin', async (req, res) => {
   let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
   const pin = (req.query.pin || '1234').trim();
 
   if (!hwid) return res.status(400).send('Thiếu tham số hwid');
 
-  const licenses = loadLicenses();
-  let info = licenses[hwid];
+  let info = await licensesCollection.findOne({ hwid: hwid });
   if (!info) {
     const altHwid = hwid.replace(/-/g, '');
-    info = licenses[altHwid];
+    info = await licensesCollection.findOne({ hwid: altHwid });
     if (info) hwid = altHwid;
   }
 
@@ -310,10 +313,7 @@ app.get('/api/admin-reset-pin', (req, res) => {
     return res.status(404).json({ success: false, message: 'Không tìm thấy cơ sở này trên server!' });
   }
 
-  info.adminPin = pin;
-  info.updatedAt = new Date().toISOString();
-  licenses[hwid] = info;
-  saveLicenses(licenses);
+  await licensesCollection.updateOne({ hwid: hwid }, { $set: { adminPin: pin, updatedAt: new Date().toISOString() } });
 
   return res.json({
     success: true,
@@ -323,46 +323,49 @@ app.get('/api/admin-reset-pin', (req, res) => {
   });
 });
 
-// API cung cấp dữ liệu cho phần mềm con Admin Dashboard
-app.get('/api/admin/dashboard-data', (req, res) => {
+// API Dashboard Admin lấy danh sách từ Cloud MongoDB
+app.get('/api/admin/dashboard-data', async (req, res) => {
   const secret = req.query.secret;
   if (secret !== ADMIN_SECRET_KEY) {
     return res.status(403).json({ success: false, message: 'Từ chối truy cập! Khóa bí mật không đúng.' });
   }
 
-  const licenses = loadLicenses();
-  const customerList = [];
-  const now = Date.now();
+  try {
+    const allLicenses = await licensesCollection.find({}).toArray();
+    const customerList = [];
+    const now = Date.now();
 
-  for (let hwid in licenses) {
-    const item = licenses[hwid];
-    const isCleanHwid = hwid.startsWith('HOTEL-') ? hwid : 'HOTEL-' + hwid;
-    const phone = hwid.replace('HOTEL-', '').replace(/[^0-9]/g, '');
+    for (let item of allLicenses) {
+      const hwid = item.hwid || '';
+      const isCleanHwid = hwid.startsWith('HOTEL-') ? hwid : 'HOTEL-' + hwid;
+      const phone = hwid.replace('HOTEL-', '').replace(/[^0-9]/g, '');
 
-    customerList.push({
-      hwid: isCleanHwid,
-      phone: phone || hwid,
-      adminPin: item.adminPin || '1234',
-      expireAt: item.expireAt || 0,
-      expireDate: item.expireAt ? new Date(item.expireAt).toLocaleString('vi-VN') : 'Chưa có',
-      isActive: (item.expireAt || 0) > now,
-      daysLeft: Math.max(0, Math.ceil(((item.expireAt || 0) - now) / (1000 * 60 * 60 * 24))),
-      lastPaymentAmount: item.lastPaymentAmount || 0,
-      lastPaymentTime: item.lastPaymentTime ? new Date(item.lastPaymentTime).toLocaleString('vi-VN') : '---',
-      lastSwitchAt: item.lastSwitchTime ? new Date(item.lastSwitchTime).toLocaleString('vi-VN') : '---',
-      paymentHistory: item.paymentHistory || []
+      customerList.push({
+        hwid: isCleanHwid,
+        phone: phone || hwid,
+        adminPin: item.adminPin || '1234',
+        expireAt: item.expireAt || 0,
+        expireDate: item.expireAt ? new Date(item.expireAt).toLocaleString('vi-VN') : 'Chưa có',
+        isActive: (item.expireAt || 0) > now,
+        daysLeft: Math.max(0, Math.ceil(((item.expireAt || 0) - now) / (1000 * 60 * 60 * 24))),
+        lastPaymentAmount: item.lastPaymentAmount || 0,
+        lastPaymentTime: item.lastPaymentTime ? new Date(item.lastPaymentTime).toLocaleString('vi-VN') : '---',
+        lastSwitchAt: item.lastSwitchTime ? new Date(item.lastSwitchTime).toLocaleString('vi-VN') : '---',
+        paymentHistory: item.paymentHistory || []
+      });
+    }
+
+    customerList.sort((a, b) => b.expireAt - a.expireAt);
+
+    res.json({
+      success: true,
+      totalCustomers: customerList.length,
+      activeCustomers: customerList.filter(c => c.isActive).length,
+      customers: customerList
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Lỗi truy vấn MongoDB' });
   }
-
-  // Sắp xếp: Khách còn hạn dùng nhiều nhất lên đầu
-  customerList.sort((a, b) => b.expireAt - a.expireAt);
-
-  res.json({
-    success: true,
-    totalCustomers: customerList.length,
-    activeCustomers: customerList.filter(c => c.isActive).length,
-    customers: customerList
-  });
 });
 
 const PORT = process.env.PORT || 3000;
