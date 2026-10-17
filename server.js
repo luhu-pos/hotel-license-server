@@ -13,6 +13,7 @@ const MONGO_URI = "mongodb+srv://vominhluanytb_db_user:yhVSvXpDXvPFsa46@luan.ygb
 const client = new MongoClient(MONGO_URI);
 
 let licensesCollection;
+let staffCollection; // Collection lưu trữ thông tin nhân viên & khách gán
 
 // Kết nối MongoDB Database
 async function connectDB() {
@@ -20,6 +21,7 @@ async function connectDB() {
     await client.connect();
     const db = client.db('hotel_pos');
     licensesCollection = db.collection('licenses');
+    staffCollection = db.collection('staff');
     console.log("✅ Đã kết nối thành công tới Cloud MongoDB Atlas!");
   } catch (err) {
     console.error("❌ Lỗi kết nối MongoDB:", err);
@@ -365,6 +367,101 @@ app.get('/api/admin/dashboard-data', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Lỗi truy vấn MongoDB' });
+  }
+});
+
+// ================= API QUẢN LÝ NHÂN VIÊN & KHEN THƯỞNG =================
+
+// 1. Lấy danh sách nhân viên và danh sách khách của họ
+app.get('/api/admin/staff-list', async (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
+  try {
+    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+    const list = await staffCollection.find({}).sort({ createdAt: -1 }).toArray();
+    res.json({ success: true, staff: list });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Lỗi lấy danh sách nhân viên' });
+  }
+});
+
+// 2. Thêm nhân viên mới
+app.post('/api/admin/staff-add', async (req, res) => {
+  const { secret, name } = req.body;
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
+  if (!name || !name.trim()) return res.json({ success: false, message: 'Vui lòng nhập tên nhân viên' });
+
+  try {
+    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+    const cleanName = name.trim();
+    const exist = await staffCollection.findOne({ name: cleanName });
+    if (exist) return res.json({ success: false, message: 'Tên nhân viên này đã tồn tại!' });
+
+    await staffCollection.insertOne({
+      name: cleanName,
+      customers: [],
+      createdAt: new Date().toISOString()
+    });
+    res.json({ success: true, message: 'Đã thêm nhân viên thành công!' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Lỗi thêm nhân viên' });
+  }
+});
+
+// 3. Gán số điện thoại khách hàng cho nhân viên (chống trùng lặp)
+app.post('/api/admin/staff-assign-customer', async (req, res) => {
+  const { secret, staffName, phone } = req.body;
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
+
+  const cleanPhone = (phone || '').replace(/[^0-9]/g, '').trim();
+  if (!cleanPhone || cleanPhone.length < 9) {
+    return res.json({ success: false, message: 'Số điện thoại không hợp lệ!' });
+  }
+
+  try {
+    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+
+    // Kiểm tra xem số này đã được tính cho nhân viên nào chưa
+    const alreadyAssigned = await staffCollection.findOne({ "customers.phone": cleanPhone });
+    if (alreadyAssigned) {
+      return res.json({
+        success: false,
+        message: `Số ${cleanPhone} đã được tính cho nhân viên: "${alreadyAssigned.name}" rồi!`
+      });
+    }
+
+    // Thêm khách vào danh sách của nhân viên
+    await staffCollection.updateOne(
+      { name: staffName },
+      {
+        $push: {
+          customers: {
+            phone: cleanPhone,
+            assignedAt: new Date().toISOString()
+          }
+        }
+      }
+    );
+    res.json({ success: true, message: `Đã lưu khách ${cleanPhone} cho nhân viên ${staffName}!` });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Lỗi gán khách hàng' });
+  }
+});
+
+// 4. Xóa khách khỏi nhân viên nếu nhập nhầm
+app.post('/api/admin/staff-remove-customer', async (req, res) => {
+  const { secret, staffName, phone } = req.body;
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
+
+  try {
+    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+    await staffCollection.updateOne(
+      { name: staffName },
+      { $pull: { customers: { phone: phone } } }
+    );
+    res.json({ success: true, message: 'Đã xóa khách khỏi danh sách nhân viên!' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Lỗi xóa khách' });
   }
 });
 
