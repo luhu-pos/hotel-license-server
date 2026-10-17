@@ -559,6 +559,20 @@ app.post('/api/admin/staff-remove-customer', async (req, res) => {
   }
 });
 
+// 5. Xóa hoàn toàn nhân viên khi nghỉ việc hoặc nhập sai tên
+app.post('/api/admin/staff-delete', async (req, res) => {
+  const { secret, name } = req.body;
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
+
+  try {
+    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+    await staffCollection.deleteOne({ name: name });
+    res.json({ success: true, message: `Đã xóa nhân viên ${name} khỏi hệ thống!` });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Lỗi xóa nhân viên' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`HOTEL License Server đang chạy tại cổng ${PORT}`);
