@@ -380,6 +380,45 @@ app.get('/api/admin-reset-pin', async (req, res) => {
   });
 });
 
+// Endpoint ngưng / khóa tài khoản khẩn cấp (khi khách mất máy hoặc báo khóa)
+app.get('/api/admin-suspend', async (req, res) => {
+  let hwid = (req.query.hwid || '').trim().toUpperCase();
+  const secret = req.query.secret;
+
+  if (secret !== ADMIN_SECRET_KEY) {
+    return res.status(403).json({ success: false, message: 'Sai khóa bảo mật' });
+  }
+  if (!hwid) return res.status(400).json({ success: false, message: 'Thiếu HWID' });
+
+  let info = await licensesCollection.findOne({ hwid: hwid });
+  if (!info) {
+    const altHwid = hwid.replace(/-/g, '');
+    info = await licensesCollection.findOne({ hwid: altHwid });
+    if (info) hwid = altHwid;
+  }
+
+  if (!info) {
+    return res.status(404).json({ success: false, message: 'Không tìm thấy cơ sở này!' });
+  }
+
+  // Khóa bằng cách đưa hạn sử dụng về 0 và xóa deviceToken
+  await licensesCollection.updateOne(
+    { hwid: hwid },
+    {
+      $set: {
+        expireAt: 0,
+        deviceToken: null,
+        updatedAt: new Date().toISOString()
+      }
+    }
+  );
+
+  return res.json({
+    success: true,
+    message: `Đã khóa/ngưng hoạt động tài khoản ${hwid} thành công! Khách sẽ bị đẩy ra ngoài ngay lập tức.`
+  });
+});
+
 // API Dashboard Admin lấy danh sách từ Cloud MongoDB
 app.get('/api/admin/dashboard-data', async (req, res) => {
   const secret = req.query.secret;
