@@ -8,12 +8,13 @@ app.use(express.json());
 
 const ADMIN_SECRET_KEY = 'ADMIN_LUHU_2026';
 
-// Chuỗi kết nối MongoDB Atlas
+// Chuỗi kết nối MongoDB Atlas của bạn
 const MONGO_URI = "mongodb+srv://vominhluanytb_db_user:yhVSvXpDXvPFsa46@luan.ygb6k80.mongodb.net/hotel_pos?retryWrites=true&w=majority&appName=Luan";
 const client = new MongoClient(MONGO_URI);
 
 let licensesCollection;
-let staffCollection; // Collection lưu trữ thông tin nhân viên & khách gán
+let staffCollection;
+let settingsCollection;
 
 // Kết nối MongoDB Database
 async function connectDB() {
@@ -22,6 +23,7 @@ async function connectDB() {
     const db = client.db('hotel_pos');
     licensesCollection = db.collection('licenses');
     staffCollection = db.collection('staff');
+    settingsCollection = db.collection('system_settings');
     console.log("✅ Đã kết nối thành công tới Cloud MongoDB Atlas!");
   } catch (err) {
     console.error("❌ Lỗi kết nối MongoDB:", err);
@@ -33,6 +35,56 @@ connectDB();
 app.get('/ping', (req, res) => {
   res.send({ status: 'active', serverTime: new Date().toISOString() });
 });
+
+// ================= API THÔNG BÁO HỆ THỐNG TOÀN DIỆN =================
+
+// 1. Phía máy khách đọc thông báo định kỳ
+app.get('/api/announcement', async (req, res) => {
+  try {
+    if (!settingsCollection) {
+      return res.json({ active: false, message: '' });
+    }
+    const setting = await settingsCollection.findOne({ key: 'global_announcement' });
+    if (setting && setting.active && setting.message) {
+      return res.json({ active: true, message: setting.message });
+    }
+    return res.json({ active: false, message: '' });
+  } catch (e) {
+    res.json({ active: false, message: '' });
+  }
+});
+
+// 2. Admin cập nhật hoặc bật/tắt thông báo
+app.post('/api/admin/announcement', async (req, res) => {
+  const { secret, message, active } = req.body;
+  if (secret !== ADMIN_SECRET_KEY) {
+    return res.status(403).json({ success: false, message: 'Sai mã bí mật' });
+  }
+
+  try {
+    if (!settingsCollection) {
+      return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+    }
+
+    await settingsCollection.updateOne(
+      { key: 'global_announcement' },
+      {
+        $set: {
+          message: (message || '').trim(),
+          active: !!active,
+          updatedAt: new Date().toISOString()
+        }
+      },
+      { upsert: true }
+    );
+
+    res.json({ success: true, message: 'Đã cập nhật thông báo thành công!' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Lỗi cập nhật thông báo' });
+  }
+});
+
+// ================= API BẢN QUYỀN & MÃ PIN =================
 
 // Endpoint kiểm tra bản quyền & Xử lý chuyển đổi thiết bị kèm PIN
 app.get('/api/check-license', async (req, res) => {
@@ -153,7 +205,9 @@ app.get('/api/sync-pin', async (req, res) => {
   if (!hwid || !newPin || newPin.length !== 4) {
     return res.json({ success: false, message: 'Dữ liệu không hợp lệ' });
   }
-  if (!licensesCollection) return res.json({ success: false, message: 'Database chưa sẵn sàng' });
+  if (!licensesCollection) {
+    return res.json({ success: false, message: 'Database chưa sẵn sàng' });
+  }
 
   let info = await licensesCollection.findOne({ hwid: hwid });
   if (!info) {
@@ -170,7 +224,7 @@ app.get('/api/sync-pin', async (req, res) => {
   return res.json({ success: false, message: 'Không thể đồng bộ mã PIN' });
 });
 
-// Webhook SePay lưu trực tiếp vào MongoDB với bảng giá mới
+// Webhook SePay lưu trực tiếp vào MongoDB
 app.post('/api/sepay-webhook', async (req, res) => {
   const body = req.body;
   const content = (body.content || body.description || '').toUpperCase();
@@ -221,7 +275,7 @@ app.post('/api/sepay-webhook', async (req, res) => {
     addTimeMs = 30 * 24 * 60 * 60 * 1000;
     pkgName = '1_THANG';
   } else if (amount >= 2000) {
-    addTimeMs = 15 * 60 * 1000; // 15 Phút
+    addTimeMs = 15 * 60 * 1000;
     pkgName = '15_PHUT';
   } else {
     return res.json({ success: false, message: 'Số tiền không khớp gói bản quyền nào' });
