@@ -8,7 +8,7 @@ app.use(express.json());
 
 const ADMIN_SECRET_KEY = 'ADMIN_LUHU_2026';
 
-// Chuỗi kết nối MongoDB Atlas của bạn
+// Chuỗi kết nối MongoDB Atlas
 const MONGO_URI = "mongodb+srv://vominhluanytb_db_user:yhVSvXpDXvPFsa46@luan.ygb6k80.mongodb.net/hotel_pos?retryWrites=true&w=majority&appName=Luan";
 const client = new MongoClient(MONGO_URI);
 
@@ -170,7 +170,7 @@ app.get('/api/sync-pin', async (req, res) => {
   return res.json({ success: false, message: 'Không thể đồng bộ mã PIN' });
 });
 
-// Webhook SePay lưu trực tiếp vào MongoDB
+// Webhook SePay lưu trực tiếp vào MongoDB với bảng giá mới
 app.post('/api/sepay-webhook', async (req, res) => {
   const body = req.body;
   const content = (body.content || body.description || '').toUpperCase();
@@ -213,15 +213,16 @@ app.post('/api/sepay-webhook', async (req, res) => {
   let addTimeMs = 0;
   let pkgName = '';
 
-  if (amount >= 299000) {
+  // BẢNG GIÁ MỚI: 2.000đ/15 phút, 99.000đ/1 tháng, 499.000đ/6 tháng
+  if (amount >= 499000) {
     addTimeMs = 180 * 24 * 60 * 60 * 1000;
     pkgName = '6_THANG';
-  } else if (amount >= 59000) {
+  } else if (amount >= 99000) {
     addTimeMs = 30 * 24 * 60 * 60 * 1000;
     pkgName = '1_THANG';
   } else if (amount >= 2000) {
-    addTimeMs = 10 * 60 * 1000;
-    pkgName = '10_PHUT';
+    addTimeMs = 15 * 60 * 1000; // 15 Phút
+    pkgName = '15_PHUT';
   } else {
     return res.json({ success: false, message: 'Số tiền không khớp gói bản quyền nào' });
   }
