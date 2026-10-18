@@ -4,7 +4,7 @@ const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const ADMIN_SECRET_KEY = 'ADMIN_LUHU_2026';
 
@@ -15,6 +15,7 @@ const client = new MongoClient(MONGO_URI);
 let licensesCollection;
 let staffCollection;
 let settingsCollection;
+let hotelDataCollection; // Collection lưu trữ dữ liệu phòng & kho 6 tháng
 
 // Kết nối MongoDB Database
 async function connectDB() {
@@ -24,6 +25,7 @@ async function connectDB() {
     licensesCollection = db.collection('licenses');
     staffCollection = db.collection('staff');
     settingsCollection = db.collection('system_settings');
+    hotelDataCollection = db.collection('hotel_cloud_data');
     console.log("✅ Đã kết nối thành công tới Cloud MongoDB Atlas!");
   } catch (err) {
     console.error("❌ Lỗi kết nối MongoDB:", err);
@@ -34,6 +36,85 @@ connectDB();
 // Endpoint ping chống ngủ đông cho Render
 app.get('/ping', (req, res) => {
   res.send({ status: 'active', serverTime: new Date().toISOString() });
+});
+
+// ================= API ĐỒNG BỘ DỮ LIỆU ĐÁM MÂY (GIỮ 6 THÁNG GẦN NHẤT) =================
+
+// 1. Máy khách gửi bản sao lưu lên Server (Debounce 15 giây)
+app.post('/api/sync-data', async (req, res) => {
+  try {
+    if (!hotelDataCollection) {
+      return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+    }
+
+    let { hwid, data } = req.body;
+    if (!hwid || !data) return res.status(400).json({ success: false, message: 'Thiếu thông tin' });
+
+    hwid = hwid.trim().toUpperCase();
+
+    // Mốc thời gian 6 tháng trước (180 ngày)
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setDate(sixMonthsAgo.getDate() - 180);
+
+    // Gọt bớt các đơn hóa đơn cũ hơn 6 tháng để tiết kiệm RAM & bộ nhớ server
+    if (data.history && Array.isArray(data.history)) {
+      data.history = data.history.filter(item => {
+        const itemDate = new Date(item.checkOut || item.id);
+        return itemDate >= sixMonthsAgo;
+      });
+    }
+
+    // Gọt bớt các đợt nhập kho/chi cũ hơn 6 tháng
+    if (data.inventory && Array.isArray(data.inventory)) {
+      data.inventory = data.inventory.filter(item => {
+        const itemDate = new Date(item.createdAt || item.id);
+        return itemDate >= sixMonthsAgo;
+      });
+    }
+
+    // Lưu đè dữ liệu mới nhất vào MongoDB
+    await hotelDataCollection.updateOne(
+      { hwid: hwid },
+      {
+        $set: {
+          hwid: hwid,
+          data: data,
+          updatedAt: new Date().toISOString()
+        }
+      },
+      { upsert: true }
+    );
+
+    res.json({ success: true, message: 'Đã lưu đám mây thành công (giữ 6 tháng gần nhất)' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 2. Kéo dữ liệu về khi máy khách bị bấm "Xóa dữ liệu duyệt web"
+app.get('/api/get-data', async (req, res) => {
+  try {
+    if (!hotelDataCollection) {
+      return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+    }
+
+    let hwid = (req.query.hwid || '').trim().toUpperCase();
+    if (!hwid) return res.status(400).json({ success: false, message: 'Thiếu HWID' });
+
+    let record = await hotelDataCollection.findOne({ hwid: hwid });
+    if (!record) {
+      const altHwid = hwid.replace(/-/g, '');
+      record = await hotelDataCollection.findOne({ hwid: altHwid });
+    }
+
+    if (!record || !record.data) {
+      return res.json({ success: false, message: 'Chưa có bản lưu nào trên đám mây' });
+    }
+
+    res.json({ success: true, data: record.data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ================= API THÔNG BÁO HỆ THỐNG TOÀN DIỆN =================
@@ -267,7 +348,6 @@ app.post('/api/sepay-webhook', async (req, res) => {
   let addTimeMs = 0;
   let pkgName = '';
 
-  // BẢNG GIÁ MỚI: 2.000đ/15 phút, 99.000đ/1 tháng, 499.000đ/6 tháng
   if (amount >= 499000) {
     addTimeMs = 180 * 24 * 60 * 60 * 1000;
     pkgName = '6_THANG';
@@ -380,7 +460,7 @@ app.get('/api/admin-reset-pin', async (req, res) => {
   });
 });
 
-// Endpoint ngưng / khóa tài khoản khẩn cấp (khi khách mất máy hoặc báo khóa)
+// Endpoint ngưng / khóa tài khoản khẩn cấp
 app.get('/api/admin-suspend', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const secret = req.query.secret;
@@ -401,7 +481,6 @@ app.get('/api/admin-suspend', async (req, res) => {
     return res.status(404).json({ success: false, message: 'Không tìm thấy cơ sở này!' });
   }
 
-  // Khóa bằng cách đưa hạn sử dụng về 0 và xóa deviceToken
   await licensesCollection.updateOne(
     { hwid: hwid },
     {
@@ -415,7 +494,7 @@ app.get('/api/admin-suspend', async (req, res) => {
 
   return res.json({
     success: true,
-    message: `Đã khóa/ngưng hoạt động tài khoản ${hwid} thành công! Khách sẽ bị đẩy ra ngoài ngay lập tức.`
+    message: `Đã khóa/ngưng hoạt động tài khoản ${hwid} thành công!`
   });
 });
 
@@ -423,7 +502,7 @@ app.get('/api/admin-suspend', async (req, res) => {
 app.get('/api/admin/dashboard-data', async (req, res) => {
   const secret = req.query.secret;
   if (secret !== ADMIN_SECRET_KEY) {
-    return res.status(403).json({ success: false, message: 'Từ chối truy cập! Khóa bí mật không đúng.' });
+    return res.status(403).json({ success: false, message: 'Từ chối truy cập!' });
   }
 
   try {
@@ -466,7 +545,6 @@ app.get('/api/admin/dashboard-data', async (req, res) => {
 
 // ================= API QUẢN LÝ NHÂN VIÊN & KHEN THƯỞNG =================
 
-// 1. Lấy danh sách nhân viên và danh sách khách của họ
 app.get('/api/admin/staff-list', async (req, res) => {
   const secret = req.query.secret;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
@@ -479,7 +557,6 @@ app.get('/api/admin/staff-list', async (req, res) => {
   }
 });
 
-// 2. Thêm nhân viên mới
 app.post('/api/admin/staff-add', async (req, res) => {
   const { secret, name } = req.body;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
@@ -502,7 +579,6 @@ app.post('/api/admin/staff-add', async (req, res) => {
   }
 });
 
-// 3. Gán số điện thoại khách hàng cho nhân viên (chống trùng lặp)
 app.post('/api/admin/staff-assign-customer', async (req, res) => {
   const { secret, staffName, phone } = req.body;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
@@ -515,7 +591,6 @@ app.post('/api/admin/staff-assign-customer', async (req, res) => {
   try {
     if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
 
-    // Kiểm tra xem số này đã được tính cho nhân viên nào chưa
     const alreadyAssigned = await staffCollection.findOne({ "customers.phone": cleanPhone });
     if (alreadyAssigned) {
       return res.json({
@@ -524,7 +599,6 @@ app.post('/api/admin/staff-assign-customer', async (req, res) => {
       });
     }
 
-    // Thêm khách vào danh sách của nhân viên
     await staffCollection.updateOne(
       { name: staffName },
       {
@@ -542,7 +616,6 @@ app.post('/api/admin/staff-assign-customer', async (req, res) => {
   }
 });
 
-// 4. Xóa khách khỏi nhân viên nếu nhập nhầm
 app.post('/api/admin/staff-remove-customer', async (req, res) => {
   const { secret, staffName, phone } = req.body;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
@@ -559,7 +632,6 @@ app.post('/api/admin/staff-remove-customer', async (req, res) => {
   }
 });
 
-// 5. Xóa hoàn toàn nhân viên khi nghỉ việc hoặc nhập sai tên
 app.post('/api/admin/staff-delete', async (req, res) => {
   const { secret, name } = req.body;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
