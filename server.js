@@ -149,7 +149,7 @@ app.post('/api/admin/announcement', async (req, res) => {
   }
 });
 
-// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ THIẾT BỊ ĐÃ KHẮC PHỤC TRIỆT ĐỂ) =================
+// ================= API BẢN QUYỀN: XỬ LÝ KHÓA CỨNG THEO TOKEN =================
 app.get('/api/check-license', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
@@ -179,16 +179,16 @@ app.get('/api/check-license', async (req, res) => {
   }
 
   const todayStr = new Date().toISOString().slice(0, 10);
-  const allowedLimit = info.maxDevices || 1; // 1 máy hoặc 3 máy
+  const allowedLimit = parseInt(info.maxDevices) || 1;
 
   if (token && hwid.startsWith('HOTEL-0')) {
-    let tokens = info.deviceTokens || (info.deviceToken ? [info.deviceToken] : []);
+    let tokens = Array.isArray(info.deviceTokens) ? info.deviceTokens : (info.deviceToken ? [info.deviceToken] : []);
 
-    // 1. Máy này đã nằm sẵn trong danh sách hợp lệ
+    // 1. Máy này đã nằm trong danh sách token được phép
     if (tokens.includes(token)) {
-      // Cho qua bình thường
-    } 
-    // 2. Máy mới và chưa đầy số lượng máy cho phép
+      // Cho qua
+    }
+    // 2. Danh sách chưa đủ số lượng máy cho phép -> Đăng ký token máy này vào
     else if (tokens.length < allowedLimit) {
       tokens.push(token);
       await licensesCollection.updateOne(
@@ -202,10 +202,10 @@ app.get('/api/check-license', async (req, res) => {
           } 
         }
       );
-    } 
-    // 3. Đã đủ máy nhưng máy này CÓ NHẬP ĐÚNG PIN QUẢN TRỊ (Đổi máy có chủ đích)
+    }
+    // 3. Đã đủ số máy nhưng CÓ NHẬP ĐÚNG MÃ PIN (Thao tác đổi sang máy này)
     else if (pin && pin === (info.adminPin || "1234")) {
-      // Đẩy máy cũ nhất ra, nạp máy mới này vào
+      // Đẩy bớt máy cũ ra cho đến khi còn chỗ
       while (tokens.length >= allowedLimit) {
         tokens.shift();
       }
@@ -222,14 +222,13 @@ app.get('/api/check-license', async (req, res) => {
           }
         }
       );
-    } 
-    // 4. Máy này không có trong danh sách (đã bị máy khác ngắt) HOẶC mở mới mà không nhập đúng PIN
+    }
+    // 4. Máy này không có trong danh sách token và không nhập đúng PIN -> ĐÁ VĂNG NGAY LẬP TỨC
     else {
       return res.json({
         active: false,
-        isKicked: true, // Cờ này kích hoạt lệnh xóa sạch dữ liệu trên máy cũ
-        requirePin: true,
-        message: `Tài khoản đã đổi sang thiết bị khác! Thiết bị này đã bị ngắt kết nối.`
+        isKicked: true,
+        message: `Tài khoản đã được đăng nhập trên máy khác! Thiết bị này đã bị ngắt quyền sử dụng.`
       });
     }
   }
@@ -354,6 +353,8 @@ app.post('/api/sepay-webhook', async (req, res) => {
         expireAt: newExpire,
         package: pkgName,
         maxDevices: maxDevices,
+        deviceTokens: [], // Khi nạp gói mới, reset thiết bị để máy đầu tiên quét là nhận ngay
+        deviceToken: null,
         lastPaymentAmount: amount,
         lastPaymentTime: new Date().toISOString(),
         adminPin: existing.adminPin || "1234",
@@ -364,11 +365,10 @@ app.post('/api/sepay-webhook', async (req, res) => {
     { upsert: true }
   );
 
-  console.log(`[HOTEL POS] KÍCH HOẠT THÀNH CÔNG: ${hwid} (${pkgName} - ${maxDevices} máy) - Hạn mới: ${new Date(newExpire).toLocaleString('vi-VN')}`);
   return res.json({ success: true, hwid, expireAt: newExpire });
 });
 
-// API Admin Cấp Dùng Thử / Kích Hoạt Nhanh (POST) - Tự động xóa sạch danh sách thiết bị kẹt cũ
+// API Admin Cấp Dùng Thử / Kích Hoạt Nhanh (POST)
 app.post('/api/admin/grant-trial', async (req, res) => {
   const { secret, phone, days, maxDevices } = req.body;
   if (secret !== ADMIN_SECRET_KEY) {
@@ -403,7 +403,7 @@ app.post('/api/admin/grant-trial', async (req, res) => {
           expireAt: expireAt,
           package: `DUNG_THU_${trialDays}_NGAY`,
           maxDevices: devicesLimit,
-          deviceTokens: [], // Xóa sạch danh sách máy kẹt để nạp thiết bị mới mượt mà
+          deviceTokens: [], // Reset thiết bị để máy nào bấm Kiểm tra trước sẽ thành Máy 1
           deviceToken: null,
           lastPaymentAmount: 0,
           lastPaymentTime: new Date().toISOString(),
@@ -425,45 +425,7 @@ app.post('/api/admin/grant-trial', async (req, res) => {
   }
 });
 
-// Endpoint kích hoạt khẩn cấp qua GET
-app.get('/api/admin-activate', async (req, res) => {
-  let param = (req.query.hwid || req.query.phone || '').trim().toUpperCase();
-  const days = parseInt(req.query.days || 30);
-  const maxDevices = parseInt(req.query.maxDevices || 1);
-  if (!param) return res.send('Thiếu hwid hoặc số điện thoại');
-
-  let hwid = param.startsWith('HOTEL-') ? param : `HOTEL-${param.replace(/[^0-9]/g, '')}`;
-
-  const now = Date.now();
-  const existing = (await licensesCollection.findOne({ hwid: hwid })) || {};
-
-  const baseTime = (existing.expireAt && existing.expireAt > now) ? existing.expireAt : now;
-  const expireAt = baseTime + days * 24 * 60 * 60 * 1000;
-
-  await licensesCollection.updateOne(
-    { hwid: hwid },
-    {
-      $set: {
-        hwid: hwid,
-        expireAt: expireAt,
-        package: `${days}_NGAY_ADMIN`,
-        maxDevices: maxDevices,
-        deviceTokens: [],
-        deviceToken: null,
-        lastPaymentAmount: 0,
-        lastPaymentTime: new Date().toISOString(),
-        adminPin: existing.adminPin || "1234",
-        updatedAt: new Date().toISOString(),
-        paymentHistory: existing.paymentHistory || []
-      }
-    },
-    { upsert: true }
-  );
-
-  return res.json({ success: true, message: `Đã kích hoạt ${days} ngày (${maxDevices} máy) cho ${hwid}`, expireAt });
-});
-
-// Reset PIN về 1234 đồng thời giải phóng danh sách thiết bị
+// Reset PIN & Reset thiết bị
 app.get('/api/admin-reset-pin', async (req, res) => {
   let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
   const pin = (req.query.pin || '1234').trim();
@@ -486,7 +448,7 @@ app.get('/api/admin-reset-pin', async (req, res) => {
     { 
       $set: { 
         adminPin: pin, 
-        deviceTokens: [], // Xóa sạch danh sách máy kẹt cũ
+        deviceTokens: [], 
         deviceToken: null,
         updatedAt: new Date().toISOString() 
       } 
@@ -495,7 +457,7 @@ app.get('/api/admin-reset-pin', async (req, res) => {
 
   return res.json({
     success: true,
-    message: `Đã reset mã PIN của ${hwid} về: ${pin} và xóa sạch danh sách thiết bị cũ!`,
+    message: `Đã reset mã PIN của ${hwid} về: ${pin} và xóa danh sách thiết bị!`,
     expireAt: info.expireAt,
     expireDate: new Date(info.expireAt).toLocaleString('vi-VN')
   });
@@ -505,21 +467,8 @@ app.get('/api/admin-suspend', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const secret = req.query.secret;
 
-  if (secret !== ADMIN_SECRET_KEY) {
-    return res.status(403).json({ success: false, message: 'Sai khóa bảo mật' });
-  }
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false, message: 'Sai khóa bảo mật' });
   if (!hwid) return res.status(400).json({ success: false, message: 'Thiếu HWID' });
-
-  let info = await licensesCollection.findOne({ hwid: hwid });
-  if (!info) {
-    const altHwid = hwid.replace(/-/g, '');
-    info = await licensesCollection.findOne({ hwid: altHwid });
-    if (info) hwid = altHwid;
-  }
-
-  if (!info) {
-    return res.status(404).json({ success: false, message: 'Không tìm thấy cơ sở này!' });
-  }
 
   await licensesCollection.updateOne(
     { hwid: hwid },
@@ -533,17 +482,12 @@ app.get('/api/admin-suspend', async (req, res) => {
     }
   );
 
-  return res.json({
-    success: true,
-    message: `Đã khóa/ngưng hoạt động tài khoản ${hwid} thành công!`
-  });
+  return res.json({ success: true, message: `Đã khóa/ngưng hoạt động tài khoản ${hwid} thành công!` });
 });
 
 app.get('/api/admin/dashboard-data', async (req, res) => {
   const secret = req.query.secret;
-  if (secret !== ADMIN_SECRET_KEY) {
-    return res.status(403).json({ success: false, message: 'Từ chối truy cập!' });
-  }
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false, message: 'Từ chối truy cập!' });
 
   try {
     const allLicenses = await licensesCollection.find({}).toArray();
@@ -586,12 +530,11 @@ app.get('/api/admin/dashboard-data', async (req, res) => {
   }
 });
 
-// ================= API QUẢN LÝ NHÂN VIÊN & KHEN THƯỞNG =================
+// ================= API NHÂN VIÊN =================
 app.get('/api/admin/staff-list', async (req, res) => {
   const secret = req.query.secret;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
   try {
-    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
     const list = await staffCollection.find({}).sort({ createdAt: -1 }).toArray();
     res.json({ success: true, staff: list });
   } catch (e) {
@@ -602,19 +545,8 @@ app.get('/api/admin/staff-list', async (req, res) => {
 app.post('/api/admin/staff-add', async (req, res) => {
   const { secret, name } = req.body;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
-  if (!name || !name.trim()) return res.json({ success: false, message: 'Vui lòng nhập tên nhân viên' });
-
   try {
-    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
-    const cleanName = name.trim();
-    const exist = await staffCollection.findOne({ name: cleanName });
-    if (exist) return res.json({ success: false, message: 'Tên nhân viên này đã tồn tại!' });
-
-    await staffCollection.insertOne({
-      name: cleanName,
-      customers: [],
-      createdAt: new Date().toISOString()
-    });
+    await staffCollection.insertOne({ name: name.trim(), customers: [], createdAt: new Date().toISOString() });
     res.json({ success: true, message: 'Đã thêm nhân viên thành công!' });
   } catch (e) {
     res.status(500).json({ success: false, message: 'Lỗi thêm nhân viên' });
@@ -624,51 +556,25 @@ app.post('/api/admin/staff-add', async (req, res) => {
 app.post('/api/admin/staff-assign-customer', async (req, res) => {
   const { secret, staffName, phone } = req.body;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
-
   const cleanPhone = (phone || '').replace(/[^0-9]/g, '').trim();
-  if (!cleanPhone || cleanPhone.length < 9) {
-    return res.json({ success: false, message: 'Số điện thoại không hợp lệ!' });
-  }
 
   try {
-    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
-
-    const alreadyAssigned = await staffCollection.findOne({ "customers.phone": cleanPhone });
-    if (alreadyAssigned) {
-      return res.json({
-        success: false,
-        message: `Số ${cleanPhone} đã được tính cho nhân viên: "${alreadyAssigned.name}" rồi!`
-      });
-    }
-
     await staffCollection.updateOne(
       { name: staffName },
-      {
-        $push: {
-          customers: {
-            phone: cleanPhone,
-            assignedAt: new Date().toISOString()
-          }
-        }
-      }
+      { $push: { customers: { phone: cleanPhone, assignedAt: new Date().toISOString() } } }
     );
     res.json({ success: true, message: `Đã lưu khách ${cleanPhone} cho nhân viên ${staffName}!` });
   } catch (e) {
-    res.status(500).json({ success: false, message: 'Lỗi gán khách hàng' });
+    res.status(500).json({ success: false, message: 'Lỗi gán khách' });
   }
 });
 
 app.post('/api/admin/staff-remove-customer', async (req, res) => {
   const { secret, staffName, phone } = req.body;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
-
   try {
-    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
-    await staffCollection.updateOne(
-      { name: staffName },
-      { $pull: { customers: { phone: phone } } }
-    );
-    res.json({ success: true, message: 'Đã xóa khách khỏi danh sách nhân viên!' });
+    await staffCollection.updateOne({ name: staffName }, { $pull: { customers: { phone: phone } } });
+    res.json({ success: true, message: 'Đã xóa khách khỏi nhân viên!' });
   } catch (e) {
     res.status(500).json({ success: false, message: 'Lỗi xóa khách' });
   }
@@ -677,11 +583,9 @@ app.post('/api/admin/staff-remove-customer', async (req, res) => {
 app.post('/api/admin/staff-delete', async (req, res) => {
   const { secret, name } = req.body;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
-
   try {
-    if (!staffCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
     await staffCollection.deleteOne({ name: name });
-    res.json({ success: true, message: `Đã xóa nhân viên ${name} khỏi hệ thống!` });
+    res.json({ success: true, message: `Đã xóa nhân viên ${name}!` });
   } catch (e) {
     res.status(500).json({ success: false, message: 'Lỗi xóa nhân viên' });
   }
