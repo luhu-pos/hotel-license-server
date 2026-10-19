@@ -149,7 +149,7 @@ app.post('/api/admin/announcement', async (req, res) => {
   }
 });
 
-// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ MẢNG THIẾT BỊ) =================
+// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ THIẾT BỊ ĐÃ KHẮC PHỤC TRIỆT ĐỂ) =================
 app.get('/api/check-license', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
@@ -179,17 +179,16 @@ app.get('/api/check-license', async (req, res) => {
   }
 
   const todayStr = new Date().toISOString().slice(0, 10);
-  const allowedLimit = info.maxDevices || 1; // Giới hạn thiết bị theo gói (1 hoặc 3 máy)
+  const allowedLimit = info.maxDevices || 1; // 1 máy hoặc 3 máy
 
   if (token && hwid.startsWith('HOTEL-0')) {
-    // Đọc danh sách thiết bị
     let tokens = info.deviceTokens || (info.deviceToken ? [info.deviceToken] : []);
 
-    // 1. Máy này đã nằm trong danh sách cho phép
+    // 1. Máy này đã nằm sẵn trong danh sách hợp lệ
     if (tokens.includes(token)) {
-      // Hợp lệ, cho phép qua
-    }
-    // 2. Máy mới nhưng chưa đạt trần cho phép của gói
+      // Cho qua bình thường
+    } 
+    // 2. Máy mới và chưa đầy số lượng máy cho phép
     else if (tokens.length < allowedLimit) {
       tokens.push(token);
       await licensesCollection.updateOne(
@@ -203,35 +202,13 @@ app.get('/api/check-license', async (req, res) => {
           } 
         }
       );
-    }
-    // 3. Đã chạm trần thiết bị của gói -> Yêu cầu nhập PIN để chuyển/ngắt máy cũ
-    else {
-      const correctPin = info.adminPin || "1234";
-      if (!pin || pin !== correctPin) {
-        return res.json({
-          active: false,
-          isKicked: true,
-          requirePin: true,
-          message: `Gói của bạn cho phép tối đa ${allowedLimit} máy! Vui lòng nhập đúng PIN 4 số để chuyển sang thiết bị này (sẽ ngắt 1 máy cũ).`
-        });
-      }
-
-      if (info.lastSwitchDate !== todayStr) {
-        info.switchCountToday = 0;
-        info.lastSwitchDate = todayStr;
-      }
-
-      const MAX_SWITCH_PER_DAY = 10;
-      if ((info.switchCountToday || 0) >= MAX_SWITCH_PER_DAY) {
-        return res.json({
-          active: false,
-          isKicked: true,
-          message: 'Bạn đã đổi thiết bị quá số lần hôm nay. Vui lòng quay lại vào ngày mai!'
-        });
-      }
-
+    } 
+    // 3. Đã đủ máy nhưng máy này CÓ NHẬP ĐÚNG PIN QUẢN TRỊ (Đổi máy có chủ đích)
+    else if (pin && pin === (info.adminPin || "1234")) {
       // Đẩy máy cũ nhất ra, nạp máy mới này vào
-      tokens.shift();
+      while (tokens.length >= allowedLimit) {
+        tokens.shift();
+      }
       tokens.push(token);
 
       await licensesCollection.updateOne(
@@ -241,11 +218,19 @@ app.get('/api/check-license', async (req, res) => {
             deviceTokens: tokens,
             deviceToken: token,
             lastSwitchTime: now,
-            switchCountToday: (info.switchCountToday || 0) + 1,
             lastSwitchDate: todayStr
           }
         }
       );
+    } 
+    // 4. Máy này không có trong danh sách (đã bị máy khác ngắt) HOẶC mở mới mà không nhập đúng PIN
+    else {
+      return res.json({
+        active: false,
+        isKicked: true, // Cờ này kích hoạt lệnh xóa sạch dữ liệu trên máy cũ
+        requirePin: true,
+        message: `Tài khoản đã đổi sang thiết bị khác! Thiết bị này đã bị ngắt kết nối.`
+      });
     }
   }
 
@@ -332,7 +317,6 @@ app.post('/api/sepay-webhook', async (req, res) => {
   let pkgName = '';
   let maxDevices = 1;
 
-  // PHÂN LOẠI 3 GÓI BẢN QUYỀN
   if (amount >= 499000) {
     addTimeMs = 180 * 24 * 60 * 60 * 1000;
     pkgName = '1_MAY_6_THANG';
@@ -384,7 +368,7 @@ app.post('/api/sepay-webhook', async (req, res) => {
   return res.json({ success: true, hwid, expireAt: newExpire });
 });
 
-// API Admin Cấp Dùng Thử / Kích Hoạt Nhanh từ trang Admin Dashboard (POST)
+// API Admin Cấp Dùng Thử / Kích Hoạt Nhanh (POST) - Tự động xóa sạch danh sách thiết bị kẹt cũ
 app.post('/api/admin/grant-trial', async (req, res) => {
   const { secret, phone, days, maxDevices } = req.body;
   if (secret !== ADMIN_SECRET_KEY) {
@@ -419,6 +403,8 @@ app.post('/api/admin/grant-trial', async (req, res) => {
           expireAt: expireAt,
           package: `DUNG_THU_${trialDays}_NGAY`,
           maxDevices: devicesLimit,
+          deviceTokens: [], // Xóa sạch danh sách máy kẹt để nạp thiết bị mới mượt mà
+          deviceToken: null,
           lastPaymentAmount: 0,
           lastPaymentTime: new Date().toISOString(),
           adminPin: existing.adminPin || "1234",
@@ -462,6 +448,8 @@ app.get('/api/admin-activate', async (req, res) => {
         expireAt: expireAt,
         package: `${days}_NGAY_ADMIN`,
         maxDevices: maxDevices,
+        deviceTokens: [],
+        deviceToken: null,
         lastPaymentAmount: 0,
         lastPaymentTime: new Date().toISOString(),
         adminPin: existing.adminPin || "1234",
@@ -475,6 +463,7 @@ app.get('/api/admin-activate', async (req, res) => {
   return res.json({ success: true, message: `Đã kích hoạt ${days} ngày (${maxDevices} máy) cho ${hwid}`, expireAt });
 });
 
+// Reset PIN về 1234 đồng thời giải phóng danh sách thiết bị
 app.get('/api/admin-reset-pin', async (req, res) => {
   let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
   const pin = (req.query.pin || '1234').trim();
@@ -492,11 +481,21 @@ app.get('/api/admin-reset-pin', async (req, res) => {
     return res.status(404).json({ success: false, message: 'Không tìm thấy cơ sở này trên server!' });
   }
 
-  await licensesCollection.updateOne({ hwid: hwid }, { $set: { adminPin: pin, updatedAt: new Date().toISOString() } });
+  await licensesCollection.updateOne(
+    { hwid: hwid }, 
+    { 
+      $set: { 
+        adminPin: pin, 
+        deviceTokens: [], // Xóa sạch danh sách máy kẹt cũ
+        deviceToken: null,
+        updatedAt: new Date().toISOString() 
+      } 
+    }
+  );
 
   return res.json({
     success: true,
-    message: `Đã reset mã PIN của ${hwid} về: ${pin}`,
+    message: `Đã reset mã PIN của ${hwid} về: ${pin} và xóa sạch danh sách thiết bị cũ!`,
     expireAt: info.expireAt,
     expireDate: new Date(info.expireAt).toLocaleString('vi-VN')
   });
