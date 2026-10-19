@@ -8,16 +8,15 @@ app.use(express.json({ limit: '10mb' }));
 
 const ADMIN_SECRET_KEY = 'ADMIN_LUHU_2026';
 
-// Chuỗi kết nối MongoDB Atlas của bạn
+// Chuỗi kết nối MongoDB Atlas
 const MONGO_URI = "mongodb+srv://vominhluanytb_db_user:yhVSvXpDXvPFsa46@luan.ygb6k80.mongodb.net/hotel_pos?retryWrites=true&w=majority&appName=Luan";
 const client = new MongoClient(MONGO_URI);
 
 let licensesCollection;
 let staffCollection;
 let settingsCollection;
-let hotelDataCollection; // Collection lưu trữ dữ liệu phòng & kho 6 tháng
+let hotelDataCollection;
 
-// Kết nối MongoDB Database
 async function connectDB() {
   try {
     await client.connect();
@@ -33,14 +32,11 @@ async function connectDB() {
 }
 connectDB();
 
-// Endpoint ping chống ngủ đông cho Render
 app.get('/ping', (req, res) => {
   res.send({ status: 'active', serverTime: new Date().toISOString() });
 });
 
 // ================= API ĐỒNG BỘ DỮ LIỆU ĐÁM MÂY (GIỮ 6 THÁNG GẦN NHẤT) =================
-
-// 1. Máy khách gửi bản sao lưu lên Server (Debounce 15 giây)
 app.post('/api/sync-data', async (req, res) => {
   try {
     if (!hotelDataCollection) {
@@ -52,11 +48,9 @@ app.post('/api/sync-data', async (req, res) => {
 
     hwid = hwid.trim().toUpperCase();
 
-    // Mốc thời gian 6 tháng trước (180 ngày)
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setDate(sixMonthsAgo.getDate() - 180);
 
-    // Gọt bớt các đơn hóa đơn cũ hơn 6 tháng để tiết kiệm RAM & bộ nhớ server
     if (data.history && Array.isArray(data.history)) {
       data.history = data.history.filter(item => {
         const itemDate = new Date(item.checkOut || item.id);
@@ -64,7 +58,6 @@ app.post('/api/sync-data', async (req, res) => {
       });
     }
 
-    // Gọt bớt các đợt nhập kho/chi cũ hơn 6 tháng
     if (data.inventory && Array.isArray(data.inventory)) {
       data.inventory = data.inventory.filter(item => {
         const itemDate = new Date(item.createdAt || item.id);
@@ -72,7 +65,6 @@ app.post('/api/sync-data', async (req, res) => {
       });
     }
 
-    // Lưu đè dữ liệu mới nhất vào MongoDB
     await hotelDataCollection.updateOne(
       { hwid: hwid },
       {
@@ -91,7 +83,6 @@ app.post('/api/sync-data', async (req, res) => {
   }
 });
 
-// 2. Kéo dữ liệu về khi máy khách bị bấm "Xóa dữ liệu duyệt web"
 app.get('/api/get-data', async (req, res) => {
   try {
     if (!hotelDataCollection) {
@@ -118,13 +109,9 @@ app.get('/api/get-data', async (req, res) => {
 });
 
 // ================= API THÔNG BÁO HỆ THỐNG TOÀN DIỆN =================
-
-// 1. Phía máy khách đọc thông báo định kỳ
 app.get('/api/announcement', async (req, res) => {
   try {
-    if (!settingsCollection) {
-      return res.json({ active: false, message: '' });
-    }
+    if (!settingsCollection) return res.json({ active: false, message: '' });
     const setting = await settingsCollection.findOne({ key: 'global_announcement' });
     if (setting && setting.active && setting.message) {
       return res.json({ active: true, message: setting.message });
@@ -135,7 +122,6 @@ app.get('/api/announcement', async (req, res) => {
   }
 });
 
-// 2. Admin cập nhật hoặc bật/tắt thông báo
 app.post('/api/admin/announcement', async (req, res) => {
   const { secret, message, active } = req.body;
   if (secret !== ADMIN_SECRET_KEY) {
@@ -143,9 +129,7 @@ app.post('/api/admin/announcement', async (req, res) => {
   }
 
   try {
-    if (!settingsCollection) {
-      return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
-    }
+    if (!settingsCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
 
     await settingsCollection.updateOne(
       { key: 'global_announcement' },
@@ -165,9 +149,7 @@ app.post('/api/admin/announcement', async (req, res) => {
   }
 });
 
-// ================= API BẢN QUYỀN & MÃ PIN =================
-
-// Endpoint kiểm tra bản quyền & Xử lý chuyển đổi thiết bị kèm PIN
+// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ MẢNG THIẾT BỊ) =================
 app.get('/api/check-license', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
@@ -197,17 +179,40 @@ app.get('/api/check-license', async (req, res) => {
   }
 
   const todayStr = new Date().toISOString().slice(0, 10);
+  const allowedLimit = info.maxDevices || 1; // Giới hạn thiết bị theo gói (1 hoặc 3 máy)
 
-  // Xử lý chuyển thiết bị / trình duyệt
   if (token && hwid.startsWith('HOTEL-0')) {
-    if (info.deviceToken && info.deviceToken !== token) {
+    // Đọc danh sách thiết bị
+    let tokens = info.deviceTokens || (info.deviceToken ? [info.deviceToken] : []);
+
+    // 1. Máy này đã nằm trong danh sách cho phép
+    if (tokens.includes(token)) {
+      // Hợp lệ, cho phép qua
+    }
+    // 2. Máy mới nhưng chưa đạt trần cho phép của gói
+    else if (tokens.length < allowedLimit) {
+      tokens.push(token);
+      await licensesCollection.updateOne(
+        { hwid: hwid },
+        { 
+          $set: { 
+            deviceTokens: tokens,
+            deviceToken: token,
+            lastSwitchDate: todayStr,
+            adminPin: info.adminPin || "1234"
+          } 
+        }
+      );
+    }
+    // 3. Đã chạm trần thiết bị của gói -> Yêu cầu nhập PIN để chuyển/ngắt máy cũ
+    else {
       const correctPin = info.adminPin || "1234";
       if (!pin || pin !== correctPin) {
         return res.json({
           active: false,
           isKicked: true,
           requirePin: true,
-          message: 'Mã PIN quản trị không đúng! Vui lòng nhập đúng PIN 4 số để chuyển thiết bị.'
+          message: `Gói của bạn cho phép tối đa ${allowedLimit} máy! Vui lòng nhập đúng PIN 4 số để chuyển sang thiết bị này (sẽ ngắt 1 máy cũ).`
         });
       }
 
@@ -216,32 +221,24 @@ app.get('/api/check-license', async (req, res) => {
         info.lastSwitchDate = todayStr;
       }
 
-      const MAX_SWITCH_PER_DAY = 5;
+      const MAX_SWITCH_PER_DAY = 10;
       if ((info.switchCountToday || 0) >= MAX_SWITCH_PER_DAY) {
         return res.json({
           active: false,
           isKicked: true,
-          message: 'Bạn đã đổi thiết bị quá 5 lần hôm nay. Vui lòng quay lại vào ngày mai!'
+          message: 'Bạn đã đổi thiết bị quá số lần hôm nay. Vui lòng quay lại vào ngày mai!'
         });
       }
 
-      const COOLDOWN_MS = 5 * 60 * 1000;
-      const lastSwitch = info.lastSwitchTime || 0;
-      const elapsed = now - lastSwitch;
-
-      if (elapsed < COOLDOWN_MS) {
-        const waitMinutes = Math.ceil((COOLDOWN_MS - elapsed) / 60000);
-        return res.json({
-          active: false,
-          isKicked: true,
-          message: `Tài khoản vừa chuyển thiết bị gần đây. Vui lòng đợi ${waitMinutes} phút nữa để đăng nhập lại!`
-        });
-      }
+      // Đẩy máy cũ nhất ra, nạp máy mới này vào
+      tokens.shift();
+      tokens.push(token);
 
       await licensesCollection.updateOne(
         { hwid: hwid },
         {
           $set: {
+            deviceTokens: tokens,
             deviceToken: token,
             lastSwitchTime: now,
             switchCountToday: (info.switchCountToday || 0) + 1,
@@ -249,22 +246,7 @@ app.get('/api/check-license', async (req, res) => {
           }
         }
       );
-    } else if (!info.deviceToken) {
-      await licensesCollection.updateOne(
-        { hwid: hwid },
-        {
-          $set: {
-            deviceToken: token,
-            lastSwitchTime: now,
-            switchCountToday: 0,
-            lastSwitchDate: todayStr,
-            adminPin: info.adminPin || "1234"
-          }
-        }
-      );
     }
-  } else if (token && info.deviceToken !== token) {
-    await licensesCollection.updateOne({ hwid: hwid }, { $set: { deviceToken: token } });
   }
 
   return res.json({
@@ -272,12 +254,12 @@ app.get('/api/check-license', async (req, res) => {
     expireAt: info.expireAt,
     expireDate: new Date(info.expireAt).toLocaleString('vi-VN'),
     package: info.package,
+    maxDevices: allowedLimit,
     adminPin: info.adminPin || "1234",
-    deviceToken: info.deviceToken || null
+    deviceTokens: info.deviceTokens || []
   });
 });
 
-// Đồng bộ khi khách đổi PIN trong Cài đặt
 app.get('/api/sync-pin', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const newPin = (req.query.newPin || '').trim();
@@ -297,7 +279,8 @@ app.get('/api/sync-pin', async (req, res) => {
     if (info) hwid = altHwid;
   }
 
-  if (info && info.deviceToken === token) {
+  const tokens = info ? (info.deviceTokens || [info.deviceToken]) : [];
+  if (info && tokens.includes(token)) {
     await licensesCollection.updateOne({ hwid: hwid }, { $set: { adminPin: newPin } });
     return res.json({ success: true, message: 'Đã cập nhật mã PIN trên máy chủ!' });
   }
@@ -305,7 +288,7 @@ app.get('/api/sync-pin', async (req, res) => {
   return res.json({ success: false, message: 'Không thể đồng bộ mã PIN' });
 });
 
-// Webhook SePay lưu trực tiếp vào MongoDB
+// Webhook SePay: Nhận diện 3 gói cước chuẩn
 app.post('/api/sepay-webhook', async (req, res) => {
   const body = req.body;
   const content = (body.content || body.description || '').toUpperCase();
@@ -347,16 +330,21 @@ app.post('/api/sepay-webhook', async (req, res) => {
   const now = Date.now();
   let addTimeMs = 0;
   let pkgName = '';
+  let maxDevices = 1;
 
+  // PHÂN LOẠI 3 GÓI BẢN QUYỀN
   if (amount >= 499000) {
     addTimeMs = 180 * 24 * 60 * 60 * 1000;
-    pkgName = '6_THANG';
+    pkgName = '1_MAY_6_THANG';
+    maxDevices = 1;
+  } else if (amount >= 149000) {
+    addTimeMs = 30 * 24 * 60 * 60 * 1000;
+    pkgName = '3_MAY_1_THANG';
+    maxDevices = 3;
   } else if (amount >= 99000) {
     addTimeMs = 30 * 24 * 60 * 60 * 1000;
-    pkgName = '1_THANG';
-  } else if (amount >= 2000) {
-    addTimeMs = 15 * 60 * 1000;
-    pkgName = '15_PHUT';
+    pkgName = '1_MAY_1_THANG';
+    maxDevices = 1;
   } else {
     return res.json({ success: false, message: 'Số tiền không khớp gói bản quyền nào' });
   }
@@ -369,6 +357,7 @@ app.post('/api/sepay-webhook', async (req, res) => {
   history.push({
     amount: amount,
     package: pkgName,
+    maxDevices: maxDevices,
     time: new Date().toISOString(),
     transactionId: body.id || Date.now()
   });
@@ -380,13 +369,10 @@ app.post('/api/sepay-webhook', async (req, res) => {
         hwid: hwid,
         expireAt: newExpire,
         package: pkgName,
+        maxDevices: maxDevices,
         lastPaymentAmount: amount,
         lastPaymentTime: new Date().toISOString(),
-        deviceToken: existing.deviceToken || null,
         adminPin: existing.adminPin || "1234",
-        lastSwitchTime: existing.lastSwitchTime || 0,
-        switchCountToday: existing.switchCountToday || 0,
-        lastSwitchDate: existing.lastSwitchDate || '',
         updatedAt: new Date().toISOString(),
         paymentHistory: history
       }
@@ -394,20 +380,80 @@ app.post('/api/sepay-webhook', async (req, res) => {
     { upsert: true }
   );
 
-  console.log(`[HOTEL POS] ĐÃ KÍCH HOẠT THÀNH CÔNG CHO: ${hwid} - Hạn mới: ${new Date(newExpire).toLocaleString('vi-VN')}`);
+  console.log(`[HOTEL POS] KÍCH HOẠT THÀNH CÔNG: ${hwid} (${pkgName} - ${maxDevices} máy) - Hạn mới: ${new Date(newExpire).toLocaleString('vi-VN')}`);
   return res.json({ success: true, hwid, expireAt: newExpire });
 });
 
-// Endpoint kích hoạt khẩn cấp trực tiếp
+// API Admin Cấp Dùng Thử / Kích Hoạt Nhanh từ trang Admin Dashboard (POST)
+app.post('/api/admin/grant-trial', async (req, res) => {
+  const { secret, phone, days, maxDevices } = req.body;
+  if (secret !== ADMIN_SECRET_KEY) {
+    return res.status(403).json({ success: false, message: 'Sai mã bí mật quản trị!' });
+  }
+
+  const cleanPhone = (phone || '').replace(/[^0-9]/g, '').trim();
+  const trialDays = parseInt(days) || 3;
+  const devicesLimit = parseInt(maxDevices) || 1;
+
+  if (!cleanPhone || cleanPhone.length < 9) {
+    return res.status(400).json({ success: false, message: 'Vui lòng nhập đúng số điện thoại!' });
+  }
+
+  try {
+    if (!licensesCollection) {
+      return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng!' });
+    }
+
+    const hwid = `HOTEL-${cleanPhone}`;
+    const now = Date.now();
+    const existing = (await licensesCollection.findOne({ hwid: hwid })) || {};
+
+    const baseTime = (existing.expireAt && existing.expireAt > now) ? existing.expireAt : now;
+    const expireAt = baseTime + trialDays * 24 * 60 * 60 * 1000;
+
+    await licensesCollection.updateOne(
+      { hwid: hwid },
+      {
+        $set: {
+          hwid: hwid,
+          expireAt: expireAt,
+          package: `DUNG_THU_${trialDays}_NGAY`,
+          maxDevices: devicesLimit,
+          lastPaymentAmount: 0,
+          lastPaymentTime: new Date().toISOString(),
+          adminPin: existing.adminPin || "1234",
+          updatedAt: new Date().toISOString(),
+          paymentHistory: existing.paymentHistory || []
+        }
+      },
+      { upsert: true }
+    );
+
+    res.json({
+      success: true,
+      message: `Đã cấp ${trialDays} ngày (${devicesLimit} máy) cho SĐT ${cleanPhone}!`,
+      expireDate: new Date(expireAt).toLocaleString('vi-VN')
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Lỗi server: ' + err.message });
+  }
+});
+
+// Endpoint kích hoạt khẩn cấp qua GET
 app.get('/api/admin-activate', async (req, res) => {
-  let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
+  let param = (req.query.hwid || req.query.phone || '').trim().toUpperCase();
   const days = parseInt(req.query.days || 30);
-  if (!hwid) return res.send('Thiếu hwid');
+  const maxDevices = parseInt(req.query.maxDevices || 1);
+  if (!param) return res.send('Thiếu hwid hoặc số điện thoại');
+
+  let hwid = param.startsWith('HOTEL-') ? param : `HOTEL-${param.replace(/[^0-9]/g, '')}`;
 
   const now = Date.now();
   const existing = (await licensesCollection.findOne({ hwid: hwid })) || {};
 
-  const expireAt = now + days * 24 * 60 * 60 * 1000;
+  const baseTime = (existing.expireAt && existing.expireAt > now) ? existing.expireAt : now;
+  const expireAt = baseTime + days * 24 * 60 * 60 * 1000;
+
   await licensesCollection.updateOne(
     { hwid: hwid },
     {
@@ -415,13 +461,10 @@ app.get('/api/admin-activate', async (req, res) => {
         hwid: hwid,
         expireAt: expireAt,
         package: `${days}_NGAY_ADMIN`,
+        maxDevices: maxDevices,
         lastPaymentAmount: 0,
         lastPaymentTime: new Date().toISOString(),
-        deviceToken: null,
         adminPin: existing.adminPin || "1234",
-        lastSwitchTime: 0,
-        switchCountToday: 0,
-        lastSwitchDate: '',
         updatedAt: new Date().toISOString(),
         paymentHistory: existing.paymentHistory || []
       }
@@ -429,10 +472,9 @@ app.get('/api/admin-activate', async (req, res) => {
     { upsert: true }
   );
 
-  return res.json({ success: true, message: `Đã kích hoạt ${days} ngày cho ${hwid}`, expireAt });
+  return res.json({ success: true, message: `Đã kích hoạt ${days} ngày (${maxDevices} máy) cho ${hwid}`, expireAt });
 });
 
-// Reset mã PIN về 1234 giữ nguyên ngày dùng
 app.get('/api/admin-reset-pin', async (req, res) => {
   let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
   const pin = (req.query.pin || '1234').trim();
@@ -454,13 +496,12 @@ app.get('/api/admin-reset-pin', async (req, res) => {
 
   return res.json({
     success: true,
-    message: `Đã reset mã PIN của ${hwid} về: ${pin} (Thời hạn giữ nguyên)`,
+    message: `Đã reset mã PIN của ${hwid} về: ${pin}`,
     expireAt: info.expireAt,
     expireDate: new Date(info.expireAt).toLocaleString('vi-VN')
   });
 });
 
-// Endpoint ngưng / khóa tài khoản khẩn cấp
 app.get('/api/admin-suspend', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const secret = req.query.secret;
@@ -486,6 +527,7 @@ app.get('/api/admin-suspend', async (req, res) => {
     {
       $set: {
         expireAt: 0,
+        deviceTokens: [],
         deviceToken: null,
         updatedAt: new Date().toISOString()
       }
@@ -498,7 +540,6 @@ app.get('/api/admin-suspend', async (req, res) => {
   });
 });
 
-// API Dashboard Admin lấy danh sách từ Cloud MongoDB
 app.get('/api/admin/dashboard-data', async (req, res) => {
   const secret = req.query.secret;
   if (secret !== ADMIN_SECRET_KEY) {
@@ -514,6 +555,7 @@ app.get('/api/admin/dashboard-data', async (req, res) => {
       const hwid = item.hwid || '';
       const isCleanHwid = hwid.startsWith('HOTEL-') ? hwid : 'HOTEL-' + hwid;
       const phone = hwid.replace('HOTEL-', '').replace(/[^0-9]/g, '');
+      const activeDevices = (item.deviceTokens && Array.isArray(item.deviceTokens)) ? item.deviceTokens.length : (item.deviceToken ? 1 : 0);
 
       customerList.push({
         hwid: isCleanHwid,
@@ -522,6 +564,8 @@ app.get('/api/admin/dashboard-data', async (req, res) => {
         expireAt: item.expireAt || 0,
         expireDate: item.expireAt ? new Date(item.expireAt).toLocaleString('vi-VN') : 'Chưa có',
         isActive: (item.expireAt || 0) > now,
+        maxDevices: item.maxDevices || 1,
+        activeDevices: activeDevices,
         daysLeft: Math.max(0, Math.ceil(((item.expireAt || 0) - now) / (1000 * 60 * 60 * 24))),
         lastPaymentAmount: item.lastPaymentAmount || 0,
         lastPaymentTime: item.lastPaymentTime ? new Date(item.lastPaymentTime).toLocaleString('vi-VN') : '---',
@@ -544,7 +588,6 @@ app.get('/api/admin/dashboard-data', async (req, res) => {
 });
 
 // ================= API QUẢN LÝ NHÂN VIÊN & KHEN THƯỞNG =================
-
 app.get('/api/admin/staff-list', async (req, res) => {
   const secret = req.query.secret;
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false });
