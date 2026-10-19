@@ -36,7 +36,7 @@ app.get('/ping', (req, res) => {
   res.send({ status: 'active', serverTime: new Date().toISOString() });
 });
 
-// ================= API ĐỒNG BỘ DỮ LIỆU ĐÁM MÂY (GIỮ 6 THÁNG GẦN NHẤT) =================
+// ================= API ĐỒNG BỘ DỮ LIỆU ĐÁM MÂY =================
 app.post('/api/sync-data', async (req, res) => {
   try {
     if (!hotelDataCollection) {
@@ -149,7 +149,7 @@ app.post('/api/admin/announcement', async (req, res) => {
   }
 });
 
-// ================= API BẢN QUYỀN: XỬ LÝ KHÓA CỨNG THEO TOKEN =================
+// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ THIẾT BỊ VÀ GIỚI HẠN ĐỔI MÁY) =================
 app.get('/api/check-license', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
@@ -173,22 +173,23 @@ app.get('/api/check-license', async (req, res) => {
   if (info.expireAt <= now) {
     return res.json({
       active: false,
+      isKicked: false, // Hết hạn bình thường, không được xóa SĐT của khách
       message: 'Bản quyền đã hết hạn sử dụng. Vui lòng gia hạn để tiếp tục!',
       expireAt: info.expireAt
     });
   }
 
   const todayStr = new Date().toISOString().slice(0, 10);
-  const allowedLimit = parseInt(info.maxDevices) || 1;
+  const allowedLimit = parseInt(info.maxDevices) || 1; // 1 máy hoặc 3 máy
 
   if (token && hwid.startsWith('HOTEL-0')) {
     let tokens = Array.isArray(info.deviceTokens) ? info.deviceTokens : (info.deviceToken ? [info.deviceToken] : []);
 
-    // 1. Máy này đã nằm trong danh sách token được phép
+    // 1. Máy này đã nằm sẵn trong danh sách thiết bị được cấp phép
     if (tokens.includes(token)) {
       // Cho qua
     }
-    // 2. Danh sách chưa đủ số lượng máy cho phép -> Đăng ký token máy này vào
+    // 2. Danh sách chưa đủ số lượng máy của gói -> Ghi nhận máy này vào danh sách
     else if (tokens.length < allowedLimit) {
       tokens.push(token);
       await licensesCollection.updateOne(
@@ -203,9 +204,25 @@ app.get('/api/check-license', async (req, res) => {
         }
       );
     }
-    // 3. Đã đủ số máy nhưng CÓ NHẬP ĐÚNG MÃ PIN (Thao tác đổi sang máy này)
+    // 3. Đã đủ số máy nhưng CÓ NHẬP ĐÚNG MÃ PIN (Thao tác chủ động đổi sang máy này)
     else if (pin && pin === (info.adminPin || "1234")) {
-      // Đẩy bớt máy cũ ra cho đến khi còn chỗ
+      // Reset số lượt đếm nếu sang ngày mới
+      if (info.lastSwitchDate !== todayStr) {
+        info.switchCountToday = 0;
+        info.lastSwitchDate = todayStr;
+      }
+
+      // GIỚI HẠN SỐ LẦN ĐỔI THIẾT BỊ TRONG NGÀY (5 LẦN/NGÀY)
+      const MAX_SWITCH_PER_DAY = 5;
+      if ((info.switchCountToday || 0) >= MAX_SWITCH_PER_DAY) {
+        return res.json({
+          active: false,
+          isKicked: false,
+          message: `Bạn đã đổi thiết bị quá ${MAX_SWITCH_PER_DAY} lần hôm nay. Vui lòng quay lại vào ngày mai!`
+        });
+      }
+
+      // Đẩy máy cũ ra, nạp máy mới này vào
       while (tokens.length >= allowedLimit) {
         tokens.shift();
       }
@@ -218,17 +235,18 @@ app.get('/api/check-license', async (req, res) => {
             deviceTokens: tokens,
             deviceToken: token,
             lastSwitchTime: now,
+            switchCountToday: (info.switchCountToday || 0) + 1,
             lastSwitchDate: todayStr
           }
         }
       );
     }
-    // 4. Máy này không có trong danh sách token và không nhập đúng PIN -> ĐÁ VĂNG NGAY LẬP TỨC
+    // 4. Máy này không có trong danh sách token (bị máy khác đẩy ra hoặc không có PIN đúng)
     else {
       return res.json({
         active: false,
-        isKicked: true,
-        message: `Tài khoản đã được đăng nhập trên máy khác! Thiết bị này đã bị ngắt quyền sử dụng.`
+        isKicked: true, // Cờ này kích hoạt lệnh khóa cứng và xóa trên máy cũ
+        message: 'Tài khoản đã được đăng nhập trên máy khác! Thiết bị này đã bị ngắt quyền sử dụng.'
       });
     }
   }
@@ -353,7 +371,7 @@ app.post('/api/sepay-webhook', async (req, res) => {
         expireAt: newExpire,
         package: pkgName,
         maxDevices: maxDevices,
-        deviceTokens: [], // Khi nạp gói mới, reset thiết bị để máy đầu tiên quét là nhận ngay
+        deviceTokens: [], // Khi gia hạn, giải phóng thiết bị để máy đầu tiên quét là nhận ngay
         deviceToken: null,
         lastPaymentAmount: amount,
         lastPaymentTime: new Date().toISOString(),
@@ -403,8 +421,9 @@ app.post('/api/admin/grant-trial', async (req, res) => {
           expireAt: expireAt,
           package: `DUNG_THU_${trialDays}_NGAY`,
           maxDevices: devicesLimit,
-          deviceTokens: [], // Reset thiết bị để máy nào bấm Kiểm tra trước sẽ thành Máy 1
+          deviceTokens: [],
           deviceToken: null,
+          switchCountToday: 0,
           lastPaymentAmount: 0,
           lastPaymentTime: new Date().toISOString(),
           adminPin: existing.adminPin || "1234",
@@ -425,7 +444,7 @@ app.post('/api/admin/grant-trial', async (req, res) => {
   }
 });
 
-// Reset PIN & Reset thiết bị
+// Reset PIN & Reset thiết bị qua Admin
 app.get('/api/admin-reset-pin', async (req, res) => {
   let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
   const pin = (req.query.pin || '1234').trim();
@@ -450,6 +469,7 @@ app.get('/api/admin-reset-pin', async (req, res) => {
         adminPin: pin, 
         deviceTokens: [], 
         deviceToken: null,
+        switchCountToday: 0,
         updatedAt: new Date().toISOString() 
       } 
     }
