@@ -77,6 +77,14 @@ app.post('/api/sync-data', async (req, res) => {
       { upsert: true }
     );
 
+    // Đánh dấu thời điểm sync để đo lường thiết bị online
+    if (licensesCollection) {
+      await licensesCollection.updateOne(
+        { hwid: hwid },
+        { $set: { lastActivePing: Date.now() } }
+      ).catch(() => {});
+    }
+
     res.json({ success: true, message: 'Đã lưu đám mây thành công (giữ 6 tháng gần nhất)' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -173,24 +181,21 @@ app.get('/api/check-license', async (req, res) => {
   if (info.expireAt <= now) {
     return res.json({
       active: false,
-      isKicked: false, // Hết hạn bình thường, không được xóa SĐT của khách
+      isKicked: false,
       message: 'Bản quyền đã hết hạn sử dụng. Vui lòng gia hạn để tiếp tục!',
       expireAt: info.expireAt
     });
   }
 
   const todayStr = new Date().toISOString().slice(0, 10);
-  const allowedLimit = parseInt(info.maxDevices) || 1; // 1 máy hoặc 3 máy
+  const allowedLimit = parseInt(info.maxDevices) || 1;
 
   if (token && hwid.startsWith('HOTEL-0')) {
     let tokens = Array.isArray(info.deviceTokens) ? info.deviceTokens : (info.deviceToken ? [info.deviceToken] : []);
 
-    // 1. Máy này đã nằm sẵn trong danh sách thiết bị được cấp phép
     if (tokens.includes(token)) {
       // Cho qua
-    }
-    // 2. Danh sách chưa đủ số lượng máy của gói -> Ghi nhận máy này vào danh sách
-    else if (tokens.length < allowedLimit) {
+    } else if (tokens.length < allowedLimit) {
       tokens.push(token);
       await licensesCollection.updateOne(
         { hwid: hwid },
@@ -199,20 +204,17 @@ app.get('/api/check-license', async (req, res) => {
             deviceTokens: tokens,
             deviceToken: token,
             lastSwitchDate: todayStr,
+            lastActivePing: now,
             adminPin: info.adminPin || "1234"
           } 
         }
       );
-    }
-    // 3. Đã đủ số máy nhưng CÓ NHẬP ĐÚNG MÃ PIN (Thao tác chủ động đổi sang máy này)
-    else if (pin && pin === (info.adminPin || "1234")) {
-      // Reset số lượt đếm nếu sang ngày mới
+    } else if (pin && pin === (info.adminPin || "1234")) {
       if (info.lastSwitchDate !== todayStr) {
         info.switchCountToday = 0;
         info.lastSwitchDate = todayStr;
       }
 
-      // GIỚI HẠN SỐ LẦN ĐỔI THIẾT BỊ TRONG NGÀY (5 LẦN/NGÀY)
       const MAX_SWITCH_PER_DAY = 5;
       if ((info.switchCountToday || 0) >= MAX_SWITCH_PER_DAY) {
         return res.json({
@@ -222,7 +224,6 @@ app.get('/api/check-license', async (req, res) => {
         });
       }
 
-      // Đẩy máy cũ ra, nạp máy mới này vào
       while (tokens.length >= allowedLimit) {
         tokens.shift();
       }
@@ -235,21 +236,23 @@ app.get('/api/check-license', async (req, res) => {
             deviceTokens: tokens,
             deviceToken: token,
             lastSwitchTime: now,
+            lastActivePing: now,
             switchCountToday: (info.switchCountToday || 0) + 1,
             lastSwitchDate: todayStr
           }
         }
       );
-    }
-    // 4. Máy này không có trong danh sách token (bị máy khác đẩy ra hoặc không có PIN đúng)
-    else {
+    } else {
       return res.json({
         active: false,
-        isKicked: true, // Cờ này kích hoạt lệnh khóa cứng và xóa trên máy cũ
+        isKicked: true,
         message: 'Tài khoản đã được đăng nhập trên máy khác! Thiết bị này đã bị ngắt quyền sử dụng.'
       });
     }
   }
+
+  // Cập nhật ping thời gian thực để đo tải
+  licensesCollection.updateOne({ hwid: hwid }, { $set: { lastActivePing: now } }).catch(() => {});
 
   return res.json({
     active: true,
@@ -290,13 +293,11 @@ app.get('/api/sync-pin', async (req, res) => {
   return res.json({ success: false, message: 'Không thể đồng bộ mã PIN' });
 });
 
-// Webhook SePay: Nhận diện 3 gói cước chuẩn
+// Webhook SePay
 app.post('/api/sepay-webhook', async (req, res) => {
   const body = req.body;
   const content = (body.content || body.description || '').toUpperCase();
   const amount = parseInt(body.transferAmount || body.amount || 0);
-
-  console.log(`[SePay Webhook] Tiền: ${amount} đ | Nội dung: ${content}`);
 
   if (!content.includes('HOTEL')) {
     return res.json({ success: false, message: 'Giao dịch không thuộc HOTEL POS' });
@@ -371,7 +372,7 @@ app.post('/api/sepay-webhook', async (req, res) => {
         expireAt: newExpire,
         package: pkgName,
         maxDevices: maxDevices,
-        deviceTokens: [], // Khi gia hạn, giải phóng thiết bị để máy đầu tiên quét là nhận ngay
+        deviceTokens: [],
         deviceToken: null,
         lastPaymentAmount: amount,
         lastPaymentTime: new Date().toISOString(),
@@ -386,7 +387,7 @@ app.post('/api/sepay-webhook', async (req, res) => {
   return res.json({ success: true, hwid, expireAt: newExpire });
 });
 
-// API Admin Cấp Dùng Thử / Kích Hoạt Nhanh (POST)
+// API Admin Cấp Dùng Thử
 app.post('/api/admin/grant-trial', async (req, res) => {
   const { secret, phone, days, maxDevices } = req.body;
   if (secret !== ADMIN_SECRET_KEY) {
@@ -444,7 +445,7 @@ app.post('/api/admin/grant-trial', async (req, res) => {
   }
 });
 
-// Reset PIN & Reset thiết bị qua Admin
+// Reset PIN
 app.get('/api/admin-reset-pin', async (req, res) => {
   let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
   const pin = (req.query.pin || '1234').trim();
@@ -608,6 +609,102 @@ app.post('/api/admin/staff-delete', async (req, res) => {
     res.json({ success: true, message: `Đã xóa nhân viên ${name}!` });
   } catch (e) {
     res.status(500).json({ success: false, message: 'Lỗi xóa nhân viên' });
+  }
+});
+
+// ================= API ĐO TẢI & TÍNH TOÁN CÔNG SUẤT HỆ THỐNG =================
+const RENDER_PLANS = {
+  "free": { name: "Render Free (512MB RAM)", maxClients: 120, ramMB: 512 },
+  "starter": { name: "Render Starter $7 (1GB RAM)", maxClients: 450, ramMB: 1024 },
+  "standard": { name: "Render Standard $25 (2GB RAM)", maxClients: 1200, ramMB: 2048 },
+  "pro": { name: "Render Pro $85 (4GB RAM)", maxClients: 3000, ramMB: 4096 }
+};
+
+const MONGO_PLANS = {
+  "M0": { name: "MongoDB M0 Free (500 Conn)", maxClients: 250, maxConn: 500 },
+  "M2": { name: "MongoDB M2 $9/th (500 Conn)", maxClients: 400, maxConn: 500 },
+  "M10": { name: "MongoDB M10 Dedicated (1500 Conn)", maxClients: 1500, maxConn: 1500 }
+};
+
+app.get('/api/admin/capacity-stats', async (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false, message: 'Từ chối truy cập!' });
+
+  try {
+    if (!licensesCollection || !settingsCollection) {
+      return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+    }
+
+    // Lấy gói hạ tầng đã lưu trong database
+    const planConfig = (await settingsCollection.findOne({ key: 'server_plan_config' })) || {
+      renderPlan: "free",
+      mongoPlan: "M0"
+    };
+
+    const curRender = RENDER_PLANS[planConfig.renderPlan] || RENDER_PLANS["free"];
+    const curMongo = MONGO_PLANS[planConfig.mongoPlan] || MONGO_PLANS["M0"];
+
+    // Sức chứa tối đa lấy theo mắt xích yếu nhất giữa Render và MongoDB
+    const maxCapacity = Math.min(curRender.maxClients, curMongo.maxClients);
+
+    // Tính số máy đang Online thực tế (có ping trong 3 phút qua)
+    const threeMinAgo = Date.now() - 3 * 60 * 1000;
+    const activeOnlineClients = await licensesCollection.countDocuments({ lastActivePing: { $gte: threeMinAgo } });
+
+    // Đếm tổng số thiết bị đã được kích hoạt còn hạn sử dụng
+    const now = Date.now();
+    const activeLicenses = await licensesCollection.find({ expireAt: { $gt: now } }).toArray();
+    let totalRegisteredDevices = 0;
+    activeLicenses.forEach(lic => {
+      const tokensCount = (lic.deviceTokens && Array.isArray(lic.deviceTokens)) ? lic.deviceTokens.length : (lic.deviceToken ? 1 : 0);
+      totalRegisteredDevices += Math.max(1, tokensCount);
+    });
+
+    const activeClientsDisplay = activeOnlineClients > 0 ? activeOnlineClients : totalRegisteredDevices;
+    const loadPercent = Math.min(100, Math.round((activeClientsDisplay / maxCapacity) * 100));
+    const ramUsageMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+
+    res.json({
+      success: true,
+      data: {
+        activeClients: activeClientsDisplay,
+        totalRegisteredDevices: totalRegisteredDevices,
+        systemCapacity: maxCapacity,
+        loadPercent: loadPercent,
+        ramUsageMB: ramUsageMB,
+        renderPlanName: curRender.name,
+        mongoPlanName: curMongo.name,
+        renderPlanKey: planConfig.renderPlan || "free",
+        mongoPlanKey: planConfig.mongoPlan || "M0"
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.post('/api/admin/update-plans', async (req, res) => {
+  const { secret, renderPlan, mongoPlan } = req.body;
+  if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false, message: 'Sai mã bảo mật' });
+
+  try {
+    if (!settingsCollection) return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
+
+    await settingsCollection.updateOne(
+      { key: 'server_plan_config' },
+      {
+        $set: {
+          renderPlan: renderPlan || "free",
+          mongoPlan: mongoPlan || "M0",
+          updatedAt: new Date().toISOString()
+        }
+      },
+      { upsert: true }
+    );
+
+    res.json({ success: true, message: 'Đã cập nhật cấu hình hạ tầng! Sức chứa hệ thống đã được tính toán lại.' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
   }
 });
 
