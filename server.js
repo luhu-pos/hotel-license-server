@@ -46,7 +46,7 @@ app.post('/api/sync-data', async (req, res) => {
     let { hwid, data } = req.body;
     if (!hwid || !data) return res.status(400).json({ success: false, message: 'Thiếu thông tin' });
 
-    hwid = hwid.trim().toUpperCase();
+    hwid = hwid.trim().toUpperCase().replace('-VIEW', '');
 
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setDate(sixMonthsAgo.getDate() - 180);
@@ -77,7 +77,6 @@ app.post('/api/sync-data', async (req, res) => {
       { upsert: true }
     );
 
-    // Đánh dấu thời điểm sync để đo lường thiết bị online
     if (licensesCollection) {
       await licensesCollection.updateOne(
         { hwid: hwid },
@@ -97,7 +96,7 @@ app.get('/api/get-data', async (req, res) => {
       return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
     }
 
-    let hwid = (req.query.hwid || '').trim().toUpperCase();
+    let hwid = (req.query.hwid || '').trim().toUpperCase().replace('-VIEW', '');
     if (!hwid) return res.status(400).json({ success: false, message: 'Thiếu HWID' });
 
     let record = await hotelDataCollection.findOne({ hwid: hwid });
@@ -157,18 +156,23 @@ app.post('/api/admin/announcement', async (req, res) => {
   }
 });
 
-// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ THIẾT BỊ VÀ GIỚI HẠN ĐỔI MÁY) =================
+// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ THIẾT BỊ VÀ PHÂN QUYỀN XEM) =================
 app.get('/api/check-license', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
   const pin = (req.query.pin || '').trim();
+  const isView = req.query.isView === '1' || hwid.endsWith('-VIEW');
+  const viewToken = (req.query.viewToken || token || '').trim();
 
-  if (!hwid) return res.status(400).json({ active: false, message: 'Thiếu HWID' });
+  // Đưa về HWID gốc của số điện thoại
+  const baseHwid = hwid.replace('-VIEW', '');
+
+  if (!baseHwid) return res.status(400).json({ active: false, message: 'Thiếu HWID' });
   if (!licensesCollection) return res.status(500).json({ active: false, message: 'Database chưa sẵn sàng' });
 
-  let info = await licensesCollection.findOne({ hwid: hwid });
+  let info = await licensesCollection.findOne({ hwid: baseHwid });
   if (!info) {
-    const altHwid = hwid.replace(/-/g, '');
+    const altHwid = baseHwid.replace(/-/g, '');
     info = await licensesCollection.findOne({ hwid: altHwid });
     if (info) hwid = altHwid;
   }
@@ -187,10 +191,48 @@ app.get('/api/check-license', async (req, res) => {
     });
   }
 
+  // --- XỬ LÝ CHO MÁY CHỦ QUÁN XEM TỪ XA (DUY NHẤT 1 MÁY XEM) ---
+  if (isView) {
+    if (pin && pin !== (info.adminPin || "1234")) {
+      return res.json({ active: false, message: 'Mã PIN Quản trị không chính xác!' });
+    }
+
+    if (viewToken) {
+      if (pin && pin === (info.adminPin || "1234")) {
+        // Đăng nhập máy xem mới -> Cập nhật token máy xem để máy xem cũ bị đá
+        await licensesCollection.updateOne(
+          { hwid: baseHwid },
+          { $set: { currentViewToken: viewToken, lastViewPing: now } }
+        );
+      } else if (info.currentViewToken && info.currentViewToken !== viewToken) {
+        // Máy xem cũ kiểm tra thấy token không khớp -> Bị đá văng
+        return res.json({
+          active: false,
+          isKicked: true,
+          message: 'Tài khoản xem từ xa vừa được mở trên một thiết bị khác!'
+        });
+      } else if (!info.currentViewToken) {
+        await licensesCollection.updateOne(
+          { hwid: baseHwid },
+          { $set: { currentViewToken: viewToken, lastViewPing: now } }
+        );
+      }
+    }
+
+    return res.json({
+      active: true,
+      expireAt: info.expireAt,
+      expireDate: new Date(info.expireAt).toLocaleString('vi-VN'),
+      package: info.package,
+      adminPin: info.adminPin || "1234"
+    });
+  }
+
+  // --- XỬ LÝ CHO MÁY NHÂN VIÊN / THU NGÂN CHÍNH ---
   const todayStr = new Date().toISOString().slice(0, 10);
   const allowedLimit = parseInt(info.maxDevices) || 1;
 
-  if (token && hwid.startsWith('HOTEL-0')) {
+  if (token && baseHwid.startsWith('HOTEL-0')) {
     let tokens = Array.isArray(info.deviceTokens) ? info.deviceTokens : (info.deviceToken ? [info.deviceToken] : []);
 
     if (tokens.includes(token)) {
@@ -198,7 +240,7 @@ app.get('/api/check-license', async (req, res) => {
     } else if (tokens.length < allowedLimit) {
       tokens.push(token);
       await licensesCollection.updateOne(
-        { hwid: hwid },
+        { hwid: baseHwid },
         { 
           $set: { 
             deviceTokens: tokens,
@@ -230,7 +272,7 @@ app.get('/api/check-license', async (req, res) => {
       tokens.push(token);
 
       await licensesCollection.updateOne(
-        { hwid: hwid },
+        { hwid: baseHwid },
         {
           $set: {
             deviceTokens: tokens,
@@ -251,8 +293,7 @@ app.get('/api/check-license', async (req, res) => {
     }
   }
 
-  // Cập nhật ping thời gian thực để đo tải
-  licensesCollection.updateOne({ hwid: hwid }, { $set: { lastActivePing: now } }).catch(() => {});
+  licensesCollection.updateOne({ hwid: baseHwid }, { $set: { lastActivePing: now } }).catch(() => {});
 
   return res.json({
     active: true,
@@ -266,7 +307,7 @@ app.get('/api/check-license', async (req, res) => {
 });
 
 app.get('/api/sync-pin', async (req, res) => {
-  let hwid = (req.query.hwid || '').trim().toUpperCase();
+  let hwid = (req.query.hwid || '').trim().toUpperCase().replace('-VIEW', '');
   const newPin = (req.query.newPin || '').trim();
   const token = (req.query.token || '').trim();
 
@@ -374,6 +415,7 @@ app.post('/api/sepay-webhook', async (req, res) => {
         maxDevices: maxDevices,
         deviceTokens: [],
         deviceToken: null,
+        currentViewToken: null,
         lastPaymentAmount: amount,
         lastPaymentTime: new Date().toISOString(),
         adminPin: existing.adminPin || "1234",
@@ -424,6 +466,7 @@ app.post('/api/admin/grant-trial', async (req, res) => {
           maxDevices: devicesLimit,
           deviceTokens: [],
           deviceToken: null,
+          currentViewToken: null,
           switchCountToday: 0,
           lastPaymentAmount: 0,
           lastPaymentTime: new Date().toISOString(),
@@ -447,7 +490,7 @@ app.post('/api/admin/grant-trial', async (req, res) => {
 
 // Reset PIN
 app.get('/api/admin-reset-pin', async (req, res) => {
-  let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase();
+  let hwid = (req.query.hwid || '').replace(/[<>]/g, '').trim().toUpperCase().replace('-VIEW', '');
   const pin = (req.query.pin || '1234').trim();
 
   if (!hwid) return res.status(400).send('Thiếu tham số hwid');
@@ -470,6 +513,7 @@ app.get('/api/admin-reset-pin', async (req, res) => {
         adminPin: pin, 
         deviceTokens: [], 
         deviceToken: null,
+        currentViewToken: null,
         switchCountToday: 0,
         updatedAt: new Date().toISOString() 
       } 
@@ -485,7 +529,7 @@ app.get('/api/admin-reset-pin', async (req, res) => {
 });
 
 app.get('/api/admin-suspend', async (req, res) => {
-  let hwid = (req.query.hwid || '').trim().toUpperCase();
+  let hwid = (req.query.hwid || '').trim().toUpperCase().replace('-VIEW', '');
   const secret = req.query.secret;
 
   if (secret !== ADMIN_SECRET_KEY) return res.status(403).json({ success: false, message: 'Sai khóa bảo mật' });
@@ -498,6 +542,7 @@ app.get('/api/admin-suspend', async (req, res) => {
         expireAt: 0,
         deviceTokens: [],
         deviceToken: null,
+        currentViewToken: null,
         updatedAt: new Date().toISOString()
       }
     }
@@ -530,6 +575,7 @@ app.get('/api/admin/dashboard-data', async (req, res) => {
         isActive: (item.expireAt || 0) > now,
         maxDevices: item.maxDevices || 1,
         activeDevices: activeDevices,
+        hasActiveViewer: !!item.currentViewToken,
         daysLeft: Math.max(0, Math.ceil(((item.expireAt || 0) - now) / (1000 * 60 * 60 * 24))),
         lastPaymentAmount: item.lastPaymentAmount || 0,
         lastPaymentTime: item.lastPaymentTime ? new Date(item.lastPaymentTime).toLocaleString('vi-VN') : '---',
@@ -635,7 +681,6 @@ app.get('/api/admin/capacity-stats', async (req, res) => {
       return res.status(500).json({ success: false, message: 'Database chưa sẵn sàng' });
     }
 
-    // Lấy gói hạ tầng đã lưu trong database
     const planConfig = (await settingsCollection.findOne({ key: 'server_plan_config' })) || {
       renderPlan: "free",
       mongoPlan: "M0"
@@ -644,14 +689,11 @@ app.get('/api/admin/capacity-stats', async (req, res) => {
     const curRender = RENDER_PLANS[planConfig.renderPlan] || RENDER_PLANS["free"];
     const curMongo = MONGO_PLANS[planConfig.mongoPlan] || MONGO_PLANS["M0"];
 
-    // Sức chứa tối đa lấy theo mắt xích yếu nhất giữa Render và MongoDB
     const maxCapacity = Math.min(curRender.maxClients, curMongo.maxClients);
 
-    // Tính số máy đang Online thực tế (có ping trong 3 phút qua)
     const threeMinAgo = Date.now() - 3 * 60 * 1000;
     const activeOnlineClients = await licensesCollection.countDocuments({ lastActivePing: { $gte: threeMinAgo } });
 
-    // Đếm tổng số thiết bị đã được kích hoạt còn hạn sử dụng
     const now = Date.now();
     const activeLicenses = await licensesCollection.find({ expireAt: { $gt: now } }).toArray();
     let totalRegisteredDevices = 0;
