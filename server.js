@@ -8,7 +8,6 @@ app.use(express.json({ limit: '10mb' }));
 
 const ADMIN_SECRET_KEY = 'ADMIN_LUHU_2026';
 
-// Chuỗi kết nối MongoDB Atlas
 const MONGO_URI = "mongodb+srv://vominhluanytb_db_user:yhVSvXpDXvPFsa46@luan.ygb6k80.mongodb.net/hotel_pos?retryWrites=true&w=majority&appName=Luan";
 const client = new MongoClient(MONGO_URI);
 
@@ -46,6 +45,7 @@ app.post('/api/sync-data', async (req, res) => {
     let { hwid, data } = req.body;
     if (!hwid || !data) return res.status(400).json({ success: false, message: 'Thiếu thông tin' });
 
+    // Luôn chuẩn hóa về HWID gốc của cơ sở
     hwid = hwid.trim().toUpperCase().replace('-VIEW', '');
 
     const sixMonthsAgo = new Date();
@@ -156,15 +156,14 @@ app.post('/api/admin/announcement', async (req, res) => {
   }
 });
 
-// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ THIẾT BỊ VÀ PHÂN QUYỀN XEM) =================
+// ================= API BẢN QUYỀN & MÃ PIN (QUẢN LÝ RIÊNG BIỆT 1 MÁY CHÍNH VÀ 1 MÁY XEM) =================
 app.get('/api/check-license', async (req, res) => {
   let hwid = (req.query.hwid || '').trim().toUpperCase();
   const token = (req.query.token || '').trim();
   const pin = (req.query.pin || '').trim();
   const isView = req.query.isView === '1' || hwid.endsWith('-VIEW');
-  const viewToken = (req.query.viewToken || token || '').trim();
+  const viewToken = (req.query.viewToken || (isView ? token : '')).trim();
 
-  // Đưa về HWID gốc của số điện thoại
   const baseHwid = hwid.replace('-VIEW', '');
 
   if (!baseHwid) return res.status(400).json({ active: false, message: 'Thiếu HWID' });
@@ -191,7 +190,7 @@ app.get('/api/check-license', async (req, res) => {
     });
   }
 
-  // --- XỬ LÝ CHO MÁY CHỦ QUÁN XEM TỪ XA (DUY NHẤT 1 MÁY XEM) ---
+  // --- 1. XỬ LÝ CHO MÁY CHỦ QUÁN XEM TỪ XA (DUY NHẤT 1 MÁY XEM) ---
   if (isView) {
     if (pin && pin !== (info.adminPin || "1234")) {
       return res.json({ active: false, message: 'Mã PIN Quản trị không chính xác!' });
@@ -199,17 +198,17 @@ app.get('/api/check-license', async (req, res) => {
 
     if (viewToken) {
       if (pin && pin === (info.adminPin || "1234")) {
-        // Đăng nhập máy xem mới -> Cập nhật token máy xem để máy xem cũ bị đá
+        // Đăng nhập máy xem mới -> Cập nhật token máy xem, máy xem cũ sẽ bị đá văng
         await licensesCollection.updateOne(
           { hwid: baseHwid },
           { $set: { currentViewToken: viewToken, lastViewPing: now } }
         );
       } else if (info.currentViewToken && info.currentViewToken !== viewToken) {
-        // Máy xem cũ kiểm tra thấy token không khớp -> Bị đá văng
+        // Máy xem cũ đang kiểm tra định kỳ mà token không khớp -> Bị đá văng
         return res.json({
           active: false,
           isKicked: true,
-          message: 'Tài khoản xem từ xa vừa được mở trên một thiết bị khác!'
+          message: 'Tài khoản xem từ xa vừa được đăng nhập trên một máy khác!'
         });
       } else if (!info.currentViewToken) {
         await licensesCollection.updateOne(
@@ -228,7 +227,7 @@ app.get('/api/check-license', async (req, res) => {
     });
   }
 
-  // --- XỬ LÝ CHO MÁY NHÂN VIÊN / THU NGÂN CHÍNH ---
+  // --- 2. XỬ LÝ CHO MÁY NHÂN VIÊN / THU NGÂN CHÍNH ---
   const todayStr = new Date().toISOString().slice(0, 10);
   const allowedLimit = parseInt(info.maxDevices) || 1;
 
@@ -236,7 +235,7 @@ app.get('/api/check-license', async (req, res) => {
     let tokens = Array.isArray(info.deviceTokens) ? info.deviceTokens : (info.deviceToken ? [info.deviceToken] : []);
 
     if (tokens.includes(token)) {
-      // Cho qua
+      // Thiết bị hợp lệ
     } else if (tokens.length < allowedLimit) {
       tokens.push(token);
       await licensesCollection.updateOne(
@@ -688,7 +687,6 @@ app.get('/api/admin/capacity-stats', async (req, res) => {
 
     const curRender = RENDER_PLANS[planConfig.renderPlan] || RENDER_PLANS["free"];
     const curMongo = MONGO_PLANS[planConfig.mongoPlan] || MONGO_PLANS["M0"];
-
     const maxCapacity = Math.min(curRender.maxClients, curMongo.maxClients);
 
     const threeMinAgo = Date.now() - 3 * 60 * 1000;
